@@ -119,6 +119,10 @@ one hot repeat when it succeeds.
 - **Timeout.** 600 s per query (Phase L), recorded as an outcome rather than an error.
 - **Restarts.** An engine is restarted after any `killed` or `unresponsive` outcome
   before continuing, and the restart is logged.
+- **Investigations don't change baselines.** Configuration changes made while
+  investigating a failure become named engine variants with their own runs. Cells hit
+  by a harness or environment fault are marked invalid and re-run; they are never
+  counted as engine outcomes.
 - **Machine hygiene.** Same power plan, background activity paused, environment
   manifest captured per run (see the infrastructure doc).
 - **Repeats.** Phase C runs the main suites on two independently launched clusters.
