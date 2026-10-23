@@ -1,0 +1,16 @@
+iceberg-etl-bench
+Copyright 2026 The iceberg-etl-bench authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Code will be adapted from the following Apache-2.0 projects. Each adapted file
+will be listed here with its source path and commit when it is added:
+
+- datafusion-contrib/datafusion-distributed (https://github.com/datafusion-contrib/datafusion-distributed)
+- apache/datafusion (https://github.com/apache/datafusion)
+- trinodb/trino (https://github.com/trinodb/trino)
+- ClickHouse/ClickBench (https://github.com/ClickHouse/ClickBench)
+
+TPC-H and TPC-DS are trademarks of the Transaction Processing Performance Council.
+Benchmarks in this repository are derived from TPC-H and TPC-DS; they are not
+official TPC results and are not comparable with published TPC results.
