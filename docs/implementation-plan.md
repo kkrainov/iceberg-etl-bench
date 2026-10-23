@@ -28,8 +28,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | Step | Goal | Size | Status |
 |---|---|---|---|
 | 1 | Skeleton, `doctor`, local stack | S | ✅ done |
-| 2 | Data generation | M | next |
-| 3a | Measurement core with Trino | M | |
+| 2 | Data generation | M | ✅ done |
+| 3a | Measurement core with Trino | M | next |
 | 3b | `dfrunner` single mode (`df`) | L | |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | |
 | 4b | Investigation helpers and deliberate failures | S | |
@@ -55,49 +55,58 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 - State survives `env down`; `--purge` without `--yes` exits with code 4.
 - 11 tests pass.
 
-## Step 2: data generation
+## Step 2: data generation ✅
 
-**Goal.** TPC-H and TPC-DS at SF1 and SF10, plus the derived `etl.*` tables, all in
-Iceberg. Regeneration is deterministic and the result is validated.
+**Delivered:**
+- **Commands:**
+  - `m0 data gen --suite tpch|tpcds|etl --sf N [--force]`, which is idempotent and
+    resumes after interruption;
+  - `m0 data status`, which validates using Iceberg metadata only: row counts, no
+    delete files, format v2, Parquet, zstd.
+- **Generator inputs:**
+  - `datagen/expected.yaml`: row counts from the specs, cross-checked against the
+    connectors;
+  - `datagen/etl/*.sql` and `params.yaml`: `store_sales_skewed` and `store_sales_dups`;
+  - a per-namespace manifest in `results/datagen/`.
+- **Skill and tests:** `runbooks/data.md`; 15 new tests (26 in total).
 
-**Scope:**
-- `m0 data gen --suite tpch|tpcds|etl --sf N` runs through Trino.
-  - Uses `CREATE TABLE … WITH (format_version = 2, format = 'PARQUET') AS SELECT * FROM tpch.sfN.<table>`.
-  - zstd compression. Trino's default target file size.
-- Namespaces `tpch_sf1`, `tpch_sf10`, `tpcds_sf1`, `tpcds_sf10`, `etl_sf10`.
-- `m0 data status`: per table, rows, bytes, file count and snapshot ID, compared with
-  the expected values.
-- `datagen/expected.yaml`: expected row counts per table and scale factor.
-  - TPC-H/TPC-DS counts come from the specs.
-  - `etl.*` counts come from the generator.
-- `datagen/etl/*.sql`: deterministic derived tables:
-  - **Zipf-skewed key tables** (for J3, W1). Skew comes from a hash of the row key, so
-    the result is identical on every run.
-  - **Duplicated rows** for dedup (W1).
-  - **Fact pairs** for fact-to-fact joins (J1).
-- Generation is idempotent and resumable. A table that exists and validates is skipped.
-  `--force` regenerates it.
-- Skill: `runbooks/data.md`.
+**Acceptance (verified independently by the lead, 2026-10-24):**
+- All six namespaces (tpch, tpcds, etl × SF1, SF10) are present. `m0 data status`
+  exits 0.
+- Re-running `m0 data gen` builds 0 tables.
+- **Spot checks against the specs:**
+  - TPC-H SF10: `lineitem` 59,986,052 rows, `orders` 15,000,000.
+  - TPC-DS: `store_sales` SF1 2,880,404 rows, `customer` SF10 500,000.
+  - Money columns are `decimal(12,2)`.
+  - Tables are zstd, format v2.
+- **ETL tables:**
+  - The top skewed key holds 13.96% of rows at SF10.
+  - `store_sales_dups` has a unique (ticket, item, version) key over 28,799,585 rows.
+  - Regenerating with `--force` gives identical rows (same checksum).
+- **Time:** all of SF10 generated in **329 s**, against the 60-minute budget.
 
-**Answers two open questions:**
-- How do TPC-DS `CHAR(n)` columns end up in Iceberg? Iceberg has no CHAR type: does
-  Trino convert or reject them? The answer goes into the methodology's normalisation
-  rules.
-- Do Trino's TPC-DS types (decimals, dates) all map cleanly? The iceberg-rust side is
-  checked in step 3b.
+| Suite | SF1 | SF10 |
+|---|---|---|
+| tpch | 12 s, 209 MiB | 50 s, 2.1 GiB |
+| tpcds | 46 s, 258 MiB | 169 s, 2.7 GiB |
+| etl | 10 s, 210 MiB | ~100 s, 2.0 GiB |
 
-**Acceptance:**
-- All tables are present, and their row counts match `expected.yaml`.
-- Re-running is a no-op.
-- SF10 generation time and size are recorded in the runbook. Budget: under 60 minutes
-  for everything at SF10 on the reference machine.
-- `doctor` gains a disk-space check sized for the requested scale factor.
+**Findings** (recorded in methodology section 3):
+- **CHAR columns:** TPC-DS `CHAR(n)` becomes Iceberg `string` with the padding
+  dropped, so both engines read unpadded strings.
+- **Spec-shaped TPC-H:** the `tpch` connector is configured for standard column names
+  and DECIMAL money columns (its defaults are unprefixed names and DOUBLE).
+- **Row-count quirk:** Trino's `tpcds` connector makes 75 `reason` rows at every SF
+  (the spec says 35 at SF1 and 45 at SF10). It's harmless and noted in `expected.yaml`.
 
-**Risks:**
-- Trino's `tpcds` connector is slow to generate at SF10. Fallback: generate Parquet
-  with tpchgen/tpcdsgen (as datafusion-distributed does), then register it in Iceberg
-  via Trino. This changes the source, not the tables.
-- SeaweedFS throughput or stability under multi-GB writes.
+**Deviations, accepted by the lead:**
+- **SeaweedFS memory.** It was OOM-killed at 768 MiB during SF10 writes. It now has a
+  1 GiB limit, plus `GOMEMLIMIT` and upload caps. The stack totals ~9.5 GiB with
+  Trino at 8 GiB.
+- **Disk check placement.** The scale-factor-sized disk check lives in `m0 data gen`,
+  not in `doctor`, because `doctor` has no `--sf`.
+- **Extra and excluded tables.** `etl_sf1` is generated too, for smoke plans.
+  `dbgen_version` is excluded.
 
 ## Step 3a: measurement core with Trino
 
@@ -145,6 +154,12 @@ methodology requires and records the results. No analysis yet.
 - Re-running with `--resume` does nothing.
 
 **Risks:**
+- **SeaweedFS memory on reads is untested.** Its read buffers are uncapped by default.
+  Watch `objstore` memory during runs, because it shares the host with the engine
+  under test.
+- **Storage garbage.** Regenerated tables leave space until SeaweedFS vacuums it
+  (11.8 GB physical vs 8.2 GB logical after step 2), and there may be orphan files
+  from a scratch namespace. Add a cleanup or vacuum to `m0 data` if it grows.
 - The page-cache drop needs root (`sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`).
   We'll decide the mechanism with the user. Options: a sudoers entry limited to that
   one command, or a privileged helper container.
@@ -180,6 +195,14 @@ sampler.
   `killed`.
 
 **Risks:**
+- **Parquet compatibility.** iceberg-rust must read what Trino writes:
+  `DELTA_LENGTH_BYTE_ARRAY` strings, INT32/INT64 decimals, and `timestamp(6)` as INT64
+  microseconds. The type check in scope covers this.
+- **Scan parallelism.** Trino writes at most 8 files per table, and SF10 `lineitem`
+  has 8 files with ~16 row groups. That may limit DataFusion's parallelism on 12
+  cores. Check that `df` splits by row group or byte range. If layout turns out to
+  favour one engine, decide (with the user) on a neutral writer setting and
+  regenerate.
 - Version alignment. datafusion-distributed pins DataFusion 55 and specific
   iceberg-rust and datafusion-iceberg revisions. `dfrunner` must use exactly those.
 - Iceberg REST catalog support in iceberg-rust against Lakekeeper (auth, warehouse

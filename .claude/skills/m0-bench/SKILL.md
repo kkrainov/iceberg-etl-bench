@@ -39,8 +39,10 @@ add `--json` for machine-readable output.
 | `m0 env status` | Health of every service, plus whether the warehouse exists |
 | `m0 env down` | Stop the stack. Data is kept. |
 | `m0 env down --purge --yes` | Stop the stack and delete all data (ask first) |
+| `m0 data gen --suite tpch --sf 10` | Generate TPC-H/TPC-DS/`etl` tables into Iceberg through Trino (`--suite tpch\|tpcds\|etl`; `etl` needs `tpcds` at the same SF). Skips tables that validate; `--force` rebuilds. |
+| `m0 data status` | Validate every generated table against `datagen/expected.yaml`; `--suite`/`--sf` narrow it and show per-table rows, size, files, snapshot |
 
-More commands (`data`, `run`, `summarize`, `triage`, …) arrive with later build steps.
+More commands (`run`, `summarize`, `triage`, …) arrive with later build steps.
 If `m0 --help` doesn't list a command, it doesn't exist yet.
 
 **Exit codes:**
@@ -57,6 +59,8 @@ If `m0 --help` doesn't list a command, it doesn't exist yet.
 | Pinned versions (images, engines, tools) | `versions.lock.yaml` |
 | Local stack definition | `infra/local/compose.yaml` |
 | Trino config (local) | `configs/trino/local/` |
+| Data generation SQL, expected row counts, etl parameters | `datagen/` (`expected.yaml`, `etl/*.sql`, `etl/params.yaml`) |
+| What `data gen` built (snapshot IDs, timings) | `results/datagen/<suite>_sf<N>.json` |
 | Container logs | `docker compose -p m0 logs <service> --tail 200` (services: `objstore`, `catalog`, `catalog-db`, `catalog-migrate`, `trino`) |
 
 ## When something goes wrong
@@ -65,6 +69,6 @@ Investigate freely with read-only means: logs, `docker compose -p m0 ps`,
 `docker stats`, cgroup files, `dmesg`, engine HTTP endpoints, and reading code. Rule
 out the environment before suspecting an engine. Grep logs; don't read them whole.
 
-- Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md)
+- Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md), [data](runbooks/data.md)
 - When you understand a new failure pattern, encode it: add a `doctor` check or a
   runbook entry, with a test where possible.

@@ -16,6 +16,11 @@ services:
       server -dir=/data -ip=objstore -ip.bind=0.0.0.0
       -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
       -volume.max=0 -master.volumeSizeLimitMB=1024
+      -s3.concurrentUploadLimitMB=256 -volume.concurrentUploadLimitMB=256
+    # Bounded upload buffers plus a Go soft memory limit: without them, multi-GB
+    # CTAS writes from Trino (data generation) got SeaweedFS OOM-killed at 768m.
+    environment:
+      GOMEMLIMIT: 640MiB
     volumes:
       - objstore-data:/data
       - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
@@ -26,7 +31,7 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-    mem_limit: 768m
+    mem_limit: 1g
 
   catalog-db:
     image: ${M0_IMAGE_CATALOG_DB}

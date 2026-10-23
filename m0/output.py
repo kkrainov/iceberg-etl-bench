@@ -35,7 +35,15 @@ def print_checks(checks: list[Check], as_json: bool, extra: dict | None = None) 
         return
     width = max((len(c.name) for c in checks), default=0)
     for c in checks:
-        print(f"{c.status.upper():<5} {c.name:<{width}}  {c.detail}")
+        print_check(c, width)
+    print_footer(checks)
+
+
+def print_footer(checks: list[Check]) -> None:
     fails = sum(c.status == FAIL for c in checks)
     warns = sum(c.status == WARN for c in checks)
     print(f"-- {len(checks)} checks, {fails} failed, {warns} warnings")
+
+
+def print_check(c: Check, width: int = 0) -> None:
+    print(f"{c.status.upper():<5} {c.name:<{width}}  {c.detail}", flush=True)

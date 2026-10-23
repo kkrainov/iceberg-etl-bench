@@ -1,0 +1,24 @@
+# Parameters of the derived etl_sf<N> tables (rendered into the *.sql files of this
+# directory as ${name}; ${src}, ${target} and ${with} are supplied by m0/datagen.py).
+# Changing anything here changes the data: regenerate with `m0 data gen --suite etl --force`
+# and update the etl counts in datagen/expected.yaml.
+
+# Build order; each entry is <table>.sql in this directory.
+tables:
+  - store_sales_skewed
+  - store_sales_dups
+
+# Salt of the row hash xxhash64(seed || ss_ticket_number || ss_item_sk).
+seed: 20261024
+
+# store_sales_skewed.skew_customer_sk: bounded continuous power law over ranks
+# 1..N (N = customers at this SF), density ∝ x^-s on [1, N+1), floored to an
+# integer rank; rank r is customer_sk r. Top-key share ≈ 14% and top-10 ≈ 41% at
+# SF1, SF10 and SF100 alike (it barely depends on N for s > 1).
+zipf_s: 1.2
+
+# store_sales_dups: a hash-sampled share of store_sales_skewed rows, each emitted
+# 1..max_copies times (uniform) with version = 1..copies. Mean 2 copies × 50% ≈
+# as many rows as store_sales.
+dup_sample_pct: 50
+dup_max_copies: 3

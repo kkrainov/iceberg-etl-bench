@@ -1,0 +1,98 @@
+# Expected row counts per suite, scale factor and table. `m0 data gen` and
+# `m0 data status` validate every table against these numbers.
+# - tpch: TPC-H spec 2.x, section 4.2.5 (lineitem is approximate in the spec; the
+#   exact dbgen count is used, which the Trino connector reproduces).
+# - tpcds: TPC-DS spec 3.x, table 3-2 (dbgen_version is not generated: no query uses it).
+# - etl: produced by datagen/etl/*.sql with datagen/etl/params.yaml; recorded from the
+#   generator. Regenerating must reproduce them exactly.
+# Table order is generation order.
+
+rows:
+  tpch:
+    1:
+      region: 5
+      nation: 25
+      supplier: 10000
+      customer: 150000
+      part: 200000
+      partsupp: 800000
+      orders: 1500000
+      lineitem: 6001215
+    10:
+      region: 5
+      nation: 25
+      supplier: 100000
+      customer: 1500000
+      part: 2000000
+      partsupp: 8000000
+      orders: 15000000
+      lineitem: 59986052
+
+  tpcds:
+    1:
+      call_center: 6
+      catalog_page: 11718
+      catalog_returns: 144067
+      catalog_sales: 1441548
+      customer: 100000
+      customer_address: 50000
+      customer_demographics: 1920800
+      date_dim: 73049
+      household_demographics: 7200
+      income_band: 20
+      inventory: 11745000
+      item: 18000
+      promotion: 300
+      reason: 75   # spec: 35. Trino's tpcds connector generates 75 at every SF
+      ship_mode: 20
+      store: 12
+      store_returns: 287514
+      store_sales: 2880404
+      time_dim: 86400
+      warehouse: 5
+      web_page: 60
+      web_returns: 71763
+      web_sales: 719384
+      web_site: 30
+    10:
+      call_center: 24
+      catalog_page: 12000
+      catalog_returns: 1439749
+      catalog_sales: 14401261
+      customer: 500000
+      customer_address: 250000
+      customer_demographics: 1920800
+      date_dim: 73049
+      household_demographics: 7200
+      income_band: 20
+      inventory: 133110000
+      item: 102000
+      promotion: 500
+      reason: 75   # spec: 45. Trino's tpcds connector generates 75 at every SF
+      ship_mode: 20
+      store: 102
+      store_returns: 2875432
+      store_sales: 28800991
+      time_dim: 86400
+      warehouse: 10
+      web_page: 200
+      web_returns: 719217
+      web_sales: 7197566
+      web_site: 42
+
+  etl:
+    1:
+      store_sales_skewed: 2880404
+      store_sales_dups: 2875553
+    10:
+      store_sales_skewed: 28800991
+      store_sales_dups: 28799585
+
+# Free disk needed before generating, in GiB per unit of scale factor: the measured
+# on-storage size (SF10 / 10, rounded up). `m0 data gen` requires twice this times the
+# SF plus a fixed reserve, to cover object-store overhead and dropped-table garbage
+# until SeaweedFS vacuums it.
+disk_gib_per_sf:
+  tpch: 0.25    # measured SF10: 2.1 GiB
+  tpcds: 0.3    # measured SF10: 2.7 GiB
+  etl: 0.25     # measured SF10: 2.0 GiB

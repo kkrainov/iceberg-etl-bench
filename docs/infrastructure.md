@@ -41,7 +41,7 @@ On the Windows host during runs:
 
 | Service | Image (pinned) | Role | Memory |
 |---|---|---|---|
-| `objstore` | SeaweedFS 4.48 (S3 API), bucket `m0-bench` | S3-compatible storage. MinIO's repository is archived, so it isn't used. | ~0.5 GiB |
+| `objstore` | SeaweedFS 4.48 (S3 API), bucket `m0-bench` | S3-compatible storage. MinIO's repository is archived, so it isn't used. | 1 GiB limit; `GOMEMLIMIT` and upload caps keep multi-GB writes under it |
 | `catalog` | Lakekeeper 0.14.x + Postgres | Iceberg REST catalog shared by both engines | ~0.5 GiB |
 | `trino` | `trinodb/trino:484` | Single node (coordinator schedules work on itself) | Engine budget |
 | `dfrunner` | Built locally | `single` mode, or `node` × N for `dfd` | Engine budget |
