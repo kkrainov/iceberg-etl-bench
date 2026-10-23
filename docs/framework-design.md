@@ -5,29 +5,26 @@
 1. **In git from the first commit.** Harness code, queries, configs, run plans,
    pinned versions and docs all live in this repo. Raw results do not (they are
    published separately as release artifacts); compact summaries can be committed.
-2. **Deterministic work lives in scripts.** Anything that can be decided by rules is
-   done by code:
-   - deploying and tearing down the environment,
-   - generating data,
-   - expanding run plans,
-   - timing, metric collection,
-   - classifying outcomes,
-   - diffing results,
-   - statistics, charts and the report.
+2. **Strict where results are produced.** Everything that turns into a published
+   number is done by code, the same way every time:
+   - deploying the environment, generating data, expanding run plans;
+   - timing and metric collection;
+   - the recorded outcome class of every cell;
+   - result diffs, statistics, charts and the report.
 
-   The agent never parses logs or computes numbers by hand.
-3. **The agent spends tokens on judgement only:**
-   - choosing what to run,
-   - reading a compact summary,
-   - deciding what to investigate next,
-   - explaining findings.
-
-   The skill (`.claude/skills/m0-bench/`) tells the agent what the harness is, which
-   commands exist, and how to read their output. It contains no logic.
-4. **Python by default. Rust only where the engine requires it.** That's one small
+   The agent does not hand-compute or hand-edit anything that ends up in results.
+3. **Free when investigating.** When something fails or looks odd, the agent works like
+   an engineer: it reads logs, inspects containers, queries engine endpoints, reads
+   engine source and writes throwaway scripts. The harness offers helpers for the
+   common cases, but they're shortcuts, not the only allowed path. Failure modes can't
+   all be predicted, so the design doesn't pretend they can.
+4. **Cheap by default.** Summaries are compact, and logs and artifacts sit in predictable
+   places, so a free-form investigation can still go straight to the right file and
+   grep it rather than reading everything.
+5. **Python by default. Rust only where the engine requires it.** That's one small
    binary, `dfrunner`, because DataFusion and datafusion-distributed are Rust
    libraries. Trino needs no custom code: official image, config templates, HTTP client.
-5. **Same measurement path for every engine.** Both engines run as long-lived servers.
+6. **Same measurement path for every engine.** Both engines run as long-lived servers.
    The same Python client measures wall time, and the same cgroup sampler collects
    CPU and memory.
 
@@ -86,12 +83,11 @@ Rules every command follows:
 | `m0 compare <run-a> <run-b>` | Before/after comparison, e.g. a new upstream version or `dfd-jo` vs `dfd` |
 | `m0 explain <run-id> <engine> <query>` | Saves plans and A5 breakdown; prints the top operators by time |
 | `m0 logs <run-id> <engine> <query> [--grep P] [--tail N]` | Bounded log excerpts |
-| `m0 triage <run-id>` | Groups non-`ok` cells and harness errors by signature (outcome, engine, normalised error, operator). Collects a diagnostic bundle per group: log excerpt, memory timeline, plan, node health, environment drift. Prints groups ranked by impact. |
+| `m0 triage <run-id>` | Best-effort grouping of non-`ok` cells and harness errors by signature (outcome, engine, normalised error). Prints each group with paths to its logs, memory timeline and plan. Errors no rule recognises are grouped as `unrecognised` for the agent to look at. |
 | `m0 repro <cell-id> [--times N] [--diag]` | Re-runs one cell in isolation, optionally with extra diagnostics: `EXPLAIN ANALYZE`, verbose engine logging, 50 Hz memory sampling. Reports whether the outcome is deterministic or flaky. |
 | `m0 bisect-mem <cell-id>` | Binary-searches the memory budget to find where a query flips from `ok` to `err_mem` or `killed`. Also reports peak RSS against the pool limit at each step. |
 | `m0 diff <run-id> <query> [--rows N]` | For `ok_mismatch`: which normalisation rules applied, and the first N differing rows |
 | `m0 sql <engine> "<query>" [--rows N]` | Ad-hoc probe against a running engine with bounded output, e.g. checking types or row counts during an investigation. Never recorded as a measurement. |
-| `m0 finding new <group-id>` | Creates a findings record pre-filled with the triage evidence (see "Investigating failures") |
 | `m0 report <run-id>…` | Builds the Markdown report and charts |
 | `m0 aws cost\|ttl\|teardown` | Phase C cost guardrails (see the infrastructure doc) |
 
@@ -111,8 +107,9 @@ The skill tells an agent:
   environment or a query fails, down to a root cause and a recorded finding;
 - when to stop and ask the user.
 
-It contains **no logic**. Anything an agent would otherwise work out by hand (numbers,
-classifications, diffs, log parsing) is a CLI command instead.
+It holds no measurement logic. Numbers, recorded outcomes and diffs come from the CLI.
+For investigation it gives orientation and hints (where things are, what usually goes
+wrong, known upstream gaps) and leaves the method to the agent.
 
 ### Files
 
@@ -136,7 +133,7 @@ classifications, diffs, log parsing) is a CLI command instead.
 - **Hard rules:**
   - Never pass `--yes` to a billable command without asking the user first.
   - Start every session with `m0 aws status` once Phase C exists.
-  - Never read raw result files; use `m0 summarize`, `m0 explain` and `m0 logs`.
+  - Never edit results or baseline configs by hand (see the investigation guardrails).
   - Treat exit code `3` (some queries failed) as data, not an error.
 - The command table, and the standard loop: `doctor → env up → data gen → run → summarize → (investigate) → report → env down`.
 - Pointers to the runbooks.
@@ -160,64 +157,73 @@ There are two kinds of failure, and they are handled differently:
   `err_unsupported`, `err_other`) **are results.** They are investigated to explain
   them, never "fixed" by tuning one engine until the query passes.
 
-**Decision tree (`investigate.md`)**
+**Investigation is open-ended.** The agent may use any read-only means:
+- logs under `results/<run-id>/logs/` and `docker logs`;
+- `docker stats` and `docker inspect`, cgroup files, `dmesg` for OOM-killer messages;
+- Trino's REST API and system tables; `dfrunner` metrics endpoints;
+- `m0 sql` probes;
+- engine and upstream source code (cloned into scratch);
+- small throwaway scripts in a scratch directory.
 
-1. **Is the environment healthy?** Run `m0 doctor` and `m0 env status`, and check the
-   drift flags in `m0 triage`. If not, mark the run's affected cells invalid, fix the
-   environment, and re-run with `m0 run --resume`.
-2. **Group failures.** `m0 triage` gives the groups. Work through them in impact order:
-   one representative cell per group, not every cell.
-3. **Is it deterministic?** Run `m0 repro --times 3`. A flaky outcome is reported as
-   flaky, with its rate; the agent doesn't keep digging into noise.
-4. **Follow the playbook for the outcome class:**
+It can also re-run cells with `m0 repro` and change things in **variant** runs (see the
+guardrails).
 
-| Outcome | Playbook |
+**Suggested approach (`investigate.md`), not a required procedure:**
+1. Rule out the environment first (`m0 doctor`, `m0 env status`). Most surprising
+   failures are environmental.
+2. Use `m0 triage` to see what failed together. Look at one representative per group.
+3. Check whether it repeats (`m0 repro --times 3`) before digging deep.
+4. Dig with whatever fits. `investigate.md` lists hints per outcome class:
+
+| Outcome | Where to look first |
 |---|---|
-| `err_mem` / `killed` | `m0 explain` to find the operator holding memory, then `m0 repro --diag` for the memory timeline, then `m0 bisect-mem` for the failure threshold. Check whether RSS ran far above the pool limit (an accounting gap, which pushes failures to `killed`) and whether the operator is known not to spill (hash join, window). Link the matching upstream issue or epic. |
-| `timeout` | Compare plans across engines and against `df` vs `dfd` (distribution problem or plan problem?). Check join order, and re-run under `dfd-jo` if relevant. Look for skew in the A5 breakdown. |
-| `unresponsive` | Node logs, Flight connection errors, restart history. Decide: did the node die, or did a query starve the others? |
-| `ok_mismatch` | `m0 diff`. Rule out harness normalisation first (floats, CHAR padding, ties, NULLs). Then cross-check `df` against `dfd`, and probe with `m0 sql`. Classify as harness bug, engine bug or ambiguous query. |
-| `err_unsupported` | Name the missing feature. Is a mechanical rewrite allowed under the rewrite rules? If so, add an override with its reason. If not, record it. Search upstream for an existing issue. |
-| `err_other` | `m0 logs --grep`. Classify as environment (go back to step 1), engine bug, or configuration. |
+| `err_mem` / `killed` | `m0 explain` for the memory-holding operator; memory timeline; `dmesg`; `m0 bisect-mem` for the threshold. Check RSS against the pool limit (accounting gap?) and whether the operator can't spill (hash join, window). |
+| `timeout` | Plans across engines, `df` vs `dfd`, join order, skew in the A5 breakdown |
+| `unresponsive` | Node logs, Flight errors, restart history, host memory |
+| `ok_mismatch` | `m0 diff`; harness normalisation first (floats, CHAR, ties, NULLs); then `df` vs `dfd` and `m0 sql` probes |
+| `err_unsupported` | The missing feature; whether a mechanical rewrite is allowed; existing upstream issues |
+| `err_other` / `unrecognised` | Logs and anything else. This is where most open-ended work happens. |
 
-5. **Record a finding.** `m0 finding new` writes a fixed-format record:
-   - symptom;
-   - commands run and the key numbers;
+5. Write down what was learned in `findings/<id>.md`, following the short template in
+   `findings/TEMPLATE.md`:
+   - symptom and evidence;
    - root cause, marked *confirmed* or *suspected*;
-   - upstream link;
-   - action (fix the harness, add a rewrite, report as a result, draft an upstream issue).
+   - upstream link if any;
+   - action taken.
 
-   Confirmed findings move from `results/` into the committed `findings/` directory.
-   They feed the report and the Phase L pain-point list.
+**Learning loop.** When an investigation finds a new failure pattern, the agent turns
+it into code: a classifier rule with a unit test, a `doctor` check or a
+`troubleshooting.md` entry. The next occurrence is then recognised automatically.
+Strict parts grow from real failures instead of being designed up front.
 
-**Guardrails for investigations**
-
-- **Configuration changes.** Any engine configuration change made during an
-  investigation becomes a named engine variant with its own run ID. It never
-  overwrites the baseline configuration, and it is reported as a variant.
-- **Harness fixes.** Re-run every affected cell and note the fix in the finding.
-- **Upstream issues and posts.** These are drafted only. Nothing is filed upstream or
-  posted without the user's approval.
+**Guardrails.** These stay strict because they protect the results and your wallet:
+- **Variants, not edits.** Any engine configuration change becomes a named variant
+  with its own run ID. Baselines are never changed during an investigation.
+- **Recorded outcomes come from code.** The agent can conclude that an `err_other` was
+  really a memory error, but it fixes the classifier rule and re-classifies. It never
+  edits results by hand.
+- **Harness fixes.** Every affected cell is re-run.
+- **Read-only probing.** No writes to the benchmark tables, and no changes to running
+  engines outside a variant.
+- **Upstream issues and posts.** These are drafted only, never filed or posted without
+  the user's approval.
 - **Ask the user first** when:
-  - the fix would change a baseline engine configuration;
+  - a baseline configuration would change;
   - a fairness question comes up;
   - a suspected engine bug is ready to draft upstream;
   - a repro would cost money (Phase C).
-- **Bounded effort.** If one failure group remains unexplained after the playbook,
-  record it as *suspected* with the evidence so far and move on. Don't spend tokens
-  without limit on a single group.
+- **Bounded effort.** If a group is still unexplained after a reasonable dig, record it
+  as *suspected* with the evidence so far, and move on.
 
 ### Keeping token use low
 
 - Only `SKILL.md` is always loaded. Runbooks load on demand.
-- **Investigation ladder.** Each step has bounded output, and the agent stops climbing
-  once the question is answered:
-  1. `m0 summarize`
-  2. `m0 compare`
-  3. `m0 explain <query>`
-  4. `m0 logs --grep … --tail N`
-- **Findings.** `m0 summarize --findings` emits a fixed-format stub per non-`ok` cell
-  and per large regression. The agent fills in only the interpretation.
+- **Start from summaries.** Use `m0 summarize`, `m0 compare` and `m0 triage` before opening
+  files.
+- **A file map in `SKILL.md`** shows where every log, plan and metric lives for a given
+  cell, so the agent can grep the right file instead of listing directories.
+- **Query results, don't print them.** Read result tables with DuckDB or pyarrow queries,
+  and read logs with `grep`, `tail` or `m0 logs --grep`, rather than whole files.
 - **Noise rules** in `analyse.md`, so the agent doesn't chase variance:
   - Trust suite totals over single S3-backed queries, which can vary by ±50%.
   - Ignore differences inside the CV flag.
@@ -233,9 +239,9 @@ There are two kinds of failure, and they are handled differently:
   - an unsupported-syntax query;
   - an injected environment fault (a stopped catalog container).
 
-  An agent following only the skill must take a clean checkout to a `m0 summarize` of
-  the smoke run, investigate each deliberate failure, and produce a correct finding
-  for it.
+  An agent using the skill must take a clean checkout to a `m0 summarize` of the
+  smoke run, and must find the real cause of each deliberate failure. It may get there
+  however it likes.
 
 ## Build order
 
@@ -247,7 +253,7 @@ Each step ships harness code, tests and the matching skill sections together.
 | 2 | Data generation and validation (TPC-H, TPC-DS, `etl.*`) | `data.md` |
 | 3 | Trino adapter, `dfrunner` (`single` mode), cgroup sampler, classifier, smoke plan | `run.md`, first `troubleshooting.md` entries |
 | 4 | Differ, stats, `summarize`, `compare`, `explain`, `logs` | `analyse.md` |
-| 4b | `triage`, `repro`, `bisect-mem`, `diff`, `sql`, `finding`; deliberate-failure cells in the smoke plan | `investigate.md`, `troubleshooting.md` |
+| 4b | `triage`, `repro`, `bisect-mem`, `diff`, `sql`; `findings/TEMPLATE.md`; deliberate-failure cells in the smoke plan | `investigate.md`, `troubleshooting.md` |
 | 5 | `dfrunner` `node` mode (`dfd`), A3 setup, B2 memory levels, B3 concurrency | `run.md` and `troubleshooting.md` updates |
 | 6 | `report` | `report.md` |
 | 7 (Phase C) | `infra/aws`, `m0 aws …` guardrails | `aws-cost.md`, AWS troubleshooting |

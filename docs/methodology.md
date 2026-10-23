@@ -155,6 +155,10 @@ Classification is done by the harness from deterministic rules, never by hand.
 | `timeout` | Exceeded the per-query timeout; the query is cancelled |
 | `unresponsive` | Health check fails after the query ends or is cancelled |
 
+Errors that no rule recognises are recorded as `err_other` and flagged `unrecognised`.
+Reviewing them may add a rule (with a test), after which the run is re-classified by
+code. Results are never re-labelled by hand.
+
 B3 also records, per client, whether *other* queries running at the same time
 survived an `err_mem`, `killed` or `unresponsive` event.
 
