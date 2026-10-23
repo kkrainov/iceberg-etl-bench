@@ -245,7 +245,8 @@ Strict parts grow from real failures instead of being designed up front.
 
 ## Build order
 
-Each step ships harness code, tests and the matching skill sections together.
+Each step ships harness code, tests and the matching skill sections together. Scope,
+acceptance criteria and risks per step: [implementation-plan.md](implementation-plan.md).
 
 | Step | Harness | Skill |
 |---|---|---|
