@@ -7,6 +7,24 @@ work is committed.
 
 Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 
+## How each step is executed
+
+1. **Brief.** The lead agent writes a self-contained brief for the step: the goal,
+   scope, acceptance criteria and risks from this plan, the relevant docs, the
+   repository conventions, and decisions already made.
+2. **Implement.** A fresh sub-agent implements the step from the brief. It doesn't
+   commit or push. If it hits something that needs the user (installs, `sudo`, a
+   fairness question), it stops and reports instead of working around it.
+3. **Verify.** The lead agent checks the result independently:
+   - reviews the diff;
+   - re-runs the acceptance criteria and tests itself;
+   - checks the docs and skill against the code.
+
+   It fixes small issues directly and sends larger ones back to a sub-agent.
+4. **Update this plan.** The lead agent marks the step done, records the acceptance
+   evidence and any deviations or new findings, and adjusts later steps.
+5. **Commit and push**, plan update included.
+
 | Step | Goal | Size | Status |
 |---|---|---|---|
 | 1 | Skeleton, `doctor`, local stack | S | ✅ done |
