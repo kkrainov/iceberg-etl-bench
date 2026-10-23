@@ -1,0 +1,28 @@
+[project]
+name = "iceberg-etl-bench"
+version = "0.1.0"
+description = "Benchmark harness: Trino (retry-policy=NONE) vs DataFusion + datafusion-distributed on Iceberg"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "trino>=0.333",
+]
+
+[project.scripts]
+m0 = "m0.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "m0"
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -67,7 +67,7 @@ Rules every command follows:
 - **`--json`** gives the same summary in machine-readable form.
 - **Exit codes** mean something: `0` ok, `1` harness error, `2` prerequisite
   missing, `3` run completed with failed queries (expected in this benchmark),
-  `4` budget or TTL guard refused.
+  `4` guard refused (budget, TTL, or a destructive action without `--yes`).
 - **Idempotent and resumable.** `m0 run` skips cells already recorded for the run
   ID. `--resume` continues after an interruption.
 - **No interactive prompts,** except an explicit `--yes` gate on billable actions.
@@ -249,7 +249,7 @@ Each step ships harness code, tests and the matching skill sections together.
 
 | Step | Harness | Skill |
 |---|---|---|
-| 1 | Repo skeleton, `m0 doctor`, local `env up/down`, versions lockfile | `SKILL.md` core, `preflight.md`, `environment.md` |
+| 1 ✅ | Repo skeleton, `m0 doctor`, local `env up/down/status`, versions lockfile | `SKILL.md` core, `preflight.md`, `environment.md` |
 | 2 | Data generation and validation (TPC-H, TPC-DS, `etl.*`) | `data.md` |
 | 3 | Trino adapter, `dfrunner` (`single` mode), cgroup sampler, classifier, smoke plan | `run.md`, first `troubleshooting.md` entries |
 | 4 | Differ, stats, `summarize`, `compare`, `explain`, `logs` | `analyse.md` |

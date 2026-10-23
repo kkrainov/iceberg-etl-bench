@@ -1,0 +1,18 @@
+# Single source of truth for every pinned version.
+# `m0 env` passes the images below to Docker Compose; `env.json` of every run
+# records this file's hash plus the resolved image digests.
+
+images:
+  trino: trinodb/trino:484                         # 2026-10-16; methodology baseline
+  catalog: quay.io/lakekeeper/catalog:v0.14.0       # Iceberg REST catalog (Phase L only)
+  catalog_db: postgres:17.6                         # Lakekeeper metadata store
+  objstore: chrislusf/seaweedfs:4.48                # S3-compatible storage (Phase L only)
+
+engines:
+  datafusion: "55"                                  # resolved by dfrunner/Cargo.lock (step 3)
+  datafusion_distributed: "4.0.0"
+  iceberg_rust: 5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3   # rev used by datafusion-distributed-iceberg
+
+tools:
+  python: ">=3.12"
+  uv: "0.12.24"

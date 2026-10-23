@@ -41,15 +41,20 @@ row-level DML, and SQL dialect compatibility.
 - `.claude/skills/m0-bench/`: how a Claude Code agent drives the harness. Built together
   with the harness; see [framework-design.md](docs/framework-design.md#claude-code-skill).
 
-## Quick start (target interface; not implemented yet)
+## Quick start
+
+Requires Docker (cgroup v2), [uv](https://docs.astral.sh/uv/) and, from build
+step 3, a Rust toolchain.
 
 ```bash
-uv run m0 doctor                       # check prerequisites
-uv run m0 env up                       # local stack: object store, catalog, engines
-uv run m0 data gen --suite tpch --sf 10
-uv run m0 run plans/phase-l-smoke.yaml
-uv run m0 summarize latest             # compact summary for humans and agents
+uv run m0 doctor                       # check prerequisites and machine settings
+uv run m0 env up --engine trino        # local stack: object store, Iceberg REST catalog, Trino
+uv run m0 env status
+uv run m0 env down                     # stop; data is kept
 ```
+
+Planned, not implemented yet: `m0 data gen`, `m0 run`, `m0 summarize` and the
+rest of the CLI in [framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).
 
 ## About Rino
 

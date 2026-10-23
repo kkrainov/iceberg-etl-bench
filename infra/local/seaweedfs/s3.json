@@ -1,0 +1,11 @@
+{
+  "identities": [
+    {
+      "name": "m0",
+      "credentials": [
+        { "accessKey": "m0local", "secretKey": "m0localsecret" }
+      ],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    }
+  ]
+}
