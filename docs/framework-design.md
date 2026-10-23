@@ -89,6 +89,96 @@ Rules every command follows:
 | `m0 report <run-id>…` | Builds the Markdown report and charts |
 | `m0 aws cost\|ttl\|teardown` | Phase C cost guardrails (see the infrastructure doc) |
 
+## Claude Code skill
+
+The skill is part of the framework, not separate documentation. It is built in the same
+change as the commands it describes, and a harness feature is not done until its
+skill entry exists and an agent has used it successfully on the smoke plan.
+
+### Purpose
+
+The skill tells an agent:
+- what this benchmark is and what each question means;
+- which `m0` commands exist and in what order to use them;
+- how to read their output;
+- when to stop and ask the user.
+
+It contains **no logic**. Anything an agent would otherwise work out by hand (numbers,
+classifications, diffs, log parsing) is a CLI command instead.
+
+### Files
+
+```text
+.claude/skills/m0-bench/
+├── SKILL.md                 # always loaded; kept under ~150 lines
+└── runbooks/                # loaded only when the task needs them
+    ├── preflight.md         # m0 doctor, prerequisites, AWS account bootstrap
+    ├── environment.md       # m0 env up/down/status, local and AWS
+    ├── data.md              # m0 data gen, validation, regeneration
+    ├── run.md               # plans, single cells, resume, B2/B3 specifics
+    ├── analyse.md           # reading summaries, investigation ladder, writing findings
+    ├── report.md            # m0 report, publishing checklist
+    ├── aws-cost.md          # guardrails, TTL, teardown, start-of-session check
+    └── troubleshooting.md   # symptom → diagnostic command → fix
+```
+
+**`SKILL.md`** has `name` / `description` frontmatter and contains:
+- A one-paragraph description of the benchmark and its two phases.
+- **Hard rules:**
+  - Never pass `--yes` to a billable command without asking the user first.
+  - Start every session with `m0 aws status` once Phase C exists.
+  - Never read raw result files; use `m0 summarize`, `m0 explain` and `m0 logs`.
+  - Treat exit code `3` (some queries failed) as data, not an error.
+- The command table, and the standard loop: `doctor → env up → data gen → run → summarize → (investigate) → report → env down`.
+- Pointers to the runbooks.
+
+**`troubleshooting.md`** covers, for each case, the symptom, the `m0` command that confirms
+it, and the fix:
+- Spot interruption.
+- Engine process killed for running out of memory, told apart from a clean memory error.
+- Trino failing to start: JVM heap, config, catalog.
+- Catalog or S3 permission errors (REST locally, Glue on AWS).
+- Arrow Flight connection errors between `dfrunner` nodes.
+- WSL resource limits and noisy-neighbour effects on the host.
+
+### Keeping token use low
+
+- Only `SKILL.md` is always loaded. Runbooks load on demand.
+- **Investigation ladder.** Each step has bounded output, and the agent stops climbing
+  once the question is answered:
+  1. `m0 summarize`
+  2. `m0 compare`
+  3. `m0 explain <query>`
+  4. `m0 logs --grep … --tail N`
+- **Findings.** `m0 summarize --findings` emits a fixed-format stub per non-`ok` cell
+  and per large regression. The agent fills in only the interpretation.
+- **Noise rules** in `analyse.md`, so the agent doesn't chase variance:
+  - Trust suite totals over single S3-backed queries, which can vary by ±50%.
+  - Ignore differences inside the CV flag.
+  - Re-run a cell before calling a result a finding.
+
+### Tests
+
+- `tests/test_skill.py` checks that every `m0` command, flag and exit code mentioned in the
+  skill exists in the CLI. This stops the skill drifting from the code.
+- The smoke plan is the acceptance test. An agent following only the skill must take a
+  clean checkout to a `m0 summarize` of the smoke run, and diagnose the deliberate
+  out-of-memory cell.
+
+## Build order
+
+Each step ships harness code, tests and the matching skill sections together.
+
+| Step | Harness | Skill |
+|---|---|---|
+| 1 | Repo skeleton, `m0 doctor`, local `env up/down`, versions lockfile | `SKILL.md` core, `preflight.md`, `environment.md` |
+| 2 | Data generation and validation (TPC-H, TPC-DS, `etl.*`) | `data.md` |
+| 3 | Trino adapter, `dfrunner` (`single` mode), cgroup sampler, classifier, smoke plan | `run.md`, first `troubleshooting.md` entries |
+| 4 | Differ, stats, `summarize`, `compare`, `explain`, `logs` | `analyse.md` |
+| 5 | `dfrunner` `node` mode (`dfd`), A3 setup, B2 memory levels, B3 concurrency | `run.md` and `troubleshooting.md` updates |
+| 6 | `report` | `report.md` |
+| 7 (Phase C) | `infra/aws`, `m0 aws …` guardrails | `aws-cost.md`, AWS troubleshooting |
+
 ## Repository layout
 
 ```text

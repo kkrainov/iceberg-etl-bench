@@ -37,7 +37,8 @@ row-level DML, and SQL dialect compatibility.
 - [docs/framework-design.md](docs/framework-design.md): harness architecture, the `m0` CLI, and which upstream code is adapted.
 - [docs/infrastructure.md](docs/infrastructure.md): local setup (Phase L) and AWS setup with cost guardrails (Phase C).
 - `docs/report-template.md`, `docs/announcement-plan.md`: *to be written*.
-- `.claude/skills/m0-bench/`: how a Claude Code agent drives the harness. *To be written.*
+- `.claude/skills/m0-bench/`: how a Claude Code agent drives the harness. Built together
+  with the harness; see [framework-design.md](docs/framework-design.md#claude-code-skill).
 
 ## Quick start (target interface; not implemented yet)
 
