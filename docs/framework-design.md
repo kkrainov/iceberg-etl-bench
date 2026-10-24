@@ -53,7 +53,7 @@
 | `dfrunner` | Rust | Adapted from datafusion-distributed's `benchmarks/remote-worker` (~400 lines). Modes: `single` (plain DataFusion) and `node` (worker plus HTTP coordinator endpoint). Adds: Iceberg catalog registration (REST or Glue via iceberg-rust), memory-pool limit and peak tracking, task-metrics export for A5, structured errors. Target size: under 1,000 lines. |
 | Environment | Bash + Docker Compose (local), Bash + AWS CLI (AWS) | `infra/local/compose.yaml`, `infra/aws/*.sh`, wrapped by `m0 env …` |
 | Data generator | SQL + Python | `datagen/*.sql`, run through Trino: CTAS from the `tpch`/`tpcds` connectors, then the `etl.*` derived tables |
-| Metrics sampler | Python | Reads cgroup v2 files of each engine container: `cpu.stat`, `memory.peak` (reset per query), `memory.events`. Falls back to 10 Hz sampling. |
+| Metrics sampler | Python | Reads cgroup v2 files of the engine and `objstore` containers without root: `cpu.stat` deltas, `memory.current` sampled at 20 Hz, lifetime `memory.peak`, `memory.events` `oom_kill`. See [Peak memory](#peak-memory). |
 | Classifier | Python | Applies the outcome rules from methodology section 7. Error-pattern table in `m0/classify_rules.yaml`, unit-tested. |
 | Differ | Python + pyarrow | Normalises results and compares them to the reference (methodology section 8). Stores fingerprints, and diffs only when they differ. |
 | Stats and report | Python + matplotlib | Medians, geomeans, bootstrap CIs, charts, Markdown report from `docs/report-template.md` |
@@ -77,8 +77,8 @@ Rules every command follows:
 | `m0 doctor` | Checks tools, versions, Docker, cgroup v2, WSL settings, disk, AWS credentials (Phase C) |
 | `m0 env up/down/status [--target local\|aws]` | Starts and stops the stack. `down` on AWS also verifies that nothing tagged is left running. |
 | `m0 data gen --suite tpch\|tpcds\|etl --sf N` | Generates and validates the tables (row counts per table against expected values) |
-| `m0 run <plan.yaml> [--engine E] [--query Q] [--resume]` | Executes the plan matrix or a single cell |
-| `m0 status [<run-id>]` | Progress, and current or last failure in one line |
+| `m0 run <plan.yaml> [--engine E] [--query Q] [--resume] [--run-id ID]` | Executes the plan's cells (or those matching `--engine`/`--query`, both repeatable) into `results/<run-id>/`. Prints only non-`ok` cells and restarts as they happen, then outcome counts per engine. An existing run ID needs `--resume` (exit code 4 otherwise, also if the plan file changed); `--resume` without `--run-id` continues the latest run of that plan. |
+| `m0 status [<run-id>\|latest]` | Progress, outcome counts, and the last failure in one line |
 | `m0 summarize <run-id\|latest>` | Outcome counts per engine, suite totals and ratios, top 10 slowest relative queries, every non-`ok` cell with a one-line reason |
 | `m0 compare <run-a> <run-b>` | Before/after comparison, e.g. a new upstream version or `dfd-jo` vs `dfd` |
 | `m0 explain <run-id> <engine> <query>` | Saves plans and A5 breakdown; prints the top operators by time |
@@ -266,7 +266,7 @@ m0-bench/
 ├── README.md  LICENSE  NOTICE
 ├── pyproject.toml  uv.lock          # Python deps: trino, pyarrow, pyyaml, httpx, matplotlib
 ├── versions.lock.yaml               # Trino image digest, DataFusion/datafusion-distributed/iceberg-rust revs, Lakekeeper, SeaweedFS, JDK
-├── m0/                              # Python package: cli, plan, engines/, metrics/, classify, diff, stats, report
+├── m0/                              # Python package: cli, plan, queries, engines/, metrics, classify (+ classify_rules.yaml), runner, store, diff, stats, report
 ├── dfrunner/                        # Rust crate: Cargo.toml, Cargo.lock, src/
 ├── queries/
 │   ├── manifest.yaml                # id, suite, class, ordered, tie_ambiguous, rewrite reasons
@@ -283,17 +283,100 @@ m0-bench/
 └── results/                         # git-ignored
 ```
 
+## Run plans
+
+`plans/*.yaml`, expanded by `m0/plan.py` into an ordered cell list. The same plan
+always gives the same list.
+
+```yaml
+name: phase-l-smoke      # default: file name
+phase: L
+sf: 1                    # ${tpch}/${tpcds}/${etl} in queries -> iceberg.<suite>_sf1
+seed: 20261024           # query-order shuffle
+engines: [trino]
+rounds: 1                # default 2 with several engines (ABBA), else 1
+mem_levels: [100]        # % of the baseline memory budget (B2, step 5)
+iterations: 3            # hot runs after each query's first run (iteration 0)
+cold: per_block          # per_query | per_block
+timeout_s: 600
+result_rows_cap: 100000  # result rows kept per iteration-0 cell
+queries:
+  - {suite: tpch, ids: [q01, q03]}
+  - {suite: etl, ids: [X1_mem], iterations: 0, expect: err_mem}  # per-entry overrides
+```
+
+- **Order:** rounds → engine blocks (engines reversed on odd rounds, so two engines
+  over two rounds run A B B A) → memory levels → queries → iteration 0, then the hot
+  iterations of that query. Query order is shuffled per round with
+  `Random("<seed>/<round>")`; every engine sees the same order within a round.
+- **`cell_id`:** `<engine>.m<mem_level>.r<round>.<suite>.<query>.i<iteration>`, e.g.
+  `trino.m100.r0.tpch.q01.i0`. It doesn't depend on the order, the seed or the filters.
+- **Cold policy:** `per_query` restarts the engine and drops the page cache before
+  every query's iteration 0 (methodology section 5). `per_block` does it once per
+  engine block, for fast smoke runs. The first cell a run executes in a block is
+  always cold, also when `--query` or `--resume` skipped the planned one. A restart
+  after `killed`/`unresponsive` drops no cache and doesn't make the next cell cold.
+- **Cold-run mechanics:** the engine container is recreated with its current limits
+  (`env_local.restart_engine`, no catalog smoke write), the adapter waits until a
+  `SELECT 1` works, then `docker run --rm --privileged <cache_drop image> sh -c 'sync;
+  echo 3 > /proc/sys/vm/drop_caches'` drops the WSL VM's page cache (image pinned in
+  `versions.lock.yaml`; no sudo).
+
+## Peak memory
+
+cgroup v2 `memory.peak` can only be reset by writing to it. The file is root-owned,
+and since kernel 6.12 a reset only applies to the file descriptor that wrote it. The
+harness runs unprivileged, so it uses:
+
+- **Lifetime `memory.peak` (exact)** when the container's lifetime peak rose during
+  the cell: the new high was reached inside the cell (`peak_mem_source = memory.peak`).
+  Always true for the first heavy query after a restart.
+- **Otherwise the maximum of `memory.current` sampled at 20 Hz**
+  (`peak_mem_source = sampled`). It can miss spikes shorter than 50 ms, so it's a
+  lower bound. The full timeline is in `cells/<cell_id>/memory.csv`.
+- **Engine-reported peak** alongside (`engine_peak_mem_bytes`: Trino
+  `peakTotalMemoryReservation`).
+
+A privileged sidecar holding the `memory.peak` file descriptor open would give exact
+per-query peaks. It was not built, because the lifetime-peak rule already covers the
+cases that matter (a query that drives the container to a new high, e.g. before an OOM
+kill), and it would add a long-running privileged container.
+
+Caveats:
+- For a JVM, container memory mostly tracks heap growth and garbage, not the query.
+  With `-XX:InitialRAMPercentage=80`, Trino's container memory rises across a block
+  towards ~7.5 GiB and stays there. Use `engine_peak_mem_bytes` for the query, and
+  container memory for "how close to the container limit".
+- `memory.current` includes page cache charged to the container. For `objstore` that's
+  a large share (reclaimable, so not an OOM risk by itself).
+
 ## Results schema
 
-`results/<run-id>/runs.parquet` has one row per executed cell:
+`results/<run-id>/runs.parquet` has one row per executed cell (`m0/store.py` `SCHEMA`):
 
-`run_id, cell_id, phase, engine, engine_variant, suite, query_id, iteration, cold,
-mem_level, concurrency, client_id, started_at, wall_ms, engine_elapsed_ms, cpu_s,
-peak_mem_bytes, mem_limit_bytes, pool_limit_bytes, outcome, error_class, error_line,
-rows, result_hash, diff_status, nodes, instance_type, spot_usd_per_h`
+| Group | Columns |
+|---|---|
+| Identity | `run_id, cell_id, seq, block, phase, plan, engine, engine_variant, suite, query_id, round, iteration, mem_level, concurrency, client_id` |
+| Cold protocol | `cold` (iteration 0 right after a restart + cache drop), `cold_policy`, `restart_s` (restart before this cell, else null), `cache_dropped` |
+| Time and CPU | `started_at, wall_ms` (harness: execute + fetch all rows), `engine_elapsed_ms, cpu_s` (cgroup `usage_usec` delta), `engine_cpu_s` |
+| Memory | `peak_mem_bytes, peak_mem_source, mem_start_bytes, engine_peak_mem_bytes, mem_limit_bytes, pool_limit_bytes, objstore_peak_mem_bytes, objstore_cpu_s, oom_kills, mem_samples` |
+| Outcome | `outcome, expected_outcome` (plan `expect`), `error_class` (rule id or signal), `error_line, unrecognised, engine_query_id` |
+| Result | `rows, result_stored` (`full`/`truncated`, iteration 0 only), `result_hash, diff_status` (`pending` until the step 4 differ) |
+| Phase C | `nodes, instance_type, spot_usd_per_h` |
 
-`env.json` holds the environment manifest: git SHA, versions lockfile, config hashes,
-host CPU/RAM/kernel, WSL config or EC2 instance metadata, start/end times.
+Until the differ exists, `ok` means "completed"; `ok_mismatch` comes with step 4.
+
+Other files in `results/<run-id>/`: `cells.jsonl` (the same rows, appended per cell;
+`runs.parquet` is rebuilt from it), `plan.yaml`, `cells.json` (the expanded plan),
+`run.log`, `cells/<cell_id>/{query.sql, engine_stats.json, memory.csv}` and
+`rows/<cell_id>.parquet` (result rows of iteration-0 cells, capped at
+`result_rows_cap` rows and 64 MiB).
+
+`env.json` holds the environment manifest: git SHA and dirty flag, the
+`versions.lock.yaml` content and hash, resolved image IDs and digests, host
+CPU/RAM/kernel/Docker, the WSL config (or EC2 instance metadata), hashes of the engine
+config files, container limits, the plan, start and end times, and one entry per
+`--resume`.
 
 ## Upstream code reuse
 

@@ -29,8 +29,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 |---|---|---|---|
 | 1 | Skeleton, `doctor`, local stack | S | ✅ done |
 | 2 | Data generation | M | ✅ done |
-| 3a | Measurement core with Trino | M | next |
-| 3b | `dfrunner` single mode (`df`) | L | |
+| 3a | Measurement core with Trino | M | ✅ done |
+| 3b | `dfrunner` single mode (`df`) | L | next |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Distributed `dfd`, memory levels, concurrency, B1 queries | L | |
@@ -108,7 +108,58 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 - **Extra and excluded tables.** `etl_sf1` is generated too, for smoke plans.
   `dbgen_version` is excluded.
 
-## Step 3a: measurement core with Trino
+## Step 3a: measurement core with Trino ✅
+
+**Delivered:**
+- **Commands:** `m0 run <plan> [--engine] [--query] [--resume] [--run-id]` and
+  `m0 status`.
+- **Plans:**
+  - plan expander with ABBA rounds, a seeded shuffle, stable cell IDs, and a `cold`
+    policy of `per_query` or `per_block`;
+  - `plans/phase-l-smoke.yaml` and `plans/phase-l-cold-check.yaml`.
+- **Engine side:**
+  - engine adapter interface plus the Trino adapter, with stats and errors from
+    `/v1/query/{id}` and cancel via `DELETE`;
+  - Trino memory configuration per the 484 docs: `query.max-memory-per-node=4GB` (also
+    DataFusion's pool size), 2 GB headroom, heap 6.4 GiB in an 8 GiB container.
+- **Measurement:**
+  - cold runs: engine restart plus a page-cache drop through a pinned privileged
+    busybox helper (no sudo);
+  - 20 Hz cgroup sampler, with exact lifetime `memory.peak` used whenever a cell raises
+    it, and the object store's peak recorded too;
+  - classifier (`m0/classify_rules.yaml`) tested against real Trino 484 errors;
+  - automatic restart after `killed` or `unresponsive`, and a timeout with cancel.
+- **Results and queries:**
+  - result store with `runs.parquet` (47 columns), `env.json`, per-cell artifacts, and
+    the cold result rows for the step 4 differ;
+  - query manifest plus a smoke subset: TPC-H q1, q3, q6; TPC-DS q3, q7, q55; ETL W1,
+    J3, and the deliberate `X1_mem`.
+- **Skill and tests:** `runbooks/run.md` and `troubleshooting.md`; 73 tests.
+
+**Acceptance (verified independently by the lead, 2026-10-24):**
+- Smoke run `verify-3a`: 33 cells in 49 s. 32 are `ok`, and the deliberate `X1_mem`
+  is `err_mem` (`EXCEEDED_LOCAL_MEMORY_LIMIT` at 4 GB). Exit code 3.
+- No nulls in wall time, CPU, container/engine/objstore peaks or outcome.
+- `--resume` recorded nothing new.
+- The sub-agent also showed:
+  - **killed recovery:** a `docker kill` mid-query became `killed`, followed by an
+    automatic restart, and the remaining cells were ok;
+  - **timeout:** the query was cancelled;
+  - **cold check:** cold runs were 2.0–2.6 s vs 0.3–0.5 s hot.
+- The objstore peaked at ~0.8 GiB, against a 1 GiB limit.
+
+**Lead fixes and findings during verification:**
+- **W1 didn't stress skew.** It partitioned by the row's primary key, so partitions
+  had 1–3 rows. It now dedups per `skew_customer_sk` (keeping each customer's latest
+  row), with a total `ORDER BY` for determinism. The top key's partition holds ~14% of
+  rows.
+- **Trino container peak isn't per-query.** The JVM keeps its grown heap, so after a
+  heavy query every later cell shows ~7.4 GiB. Methodology section 6 now says
+  per-query memory comparisons use engine-reported peaks.
+- **Open methodology question (for the user):** Trino's JVM exits by itself on a heap
+  `OutOfMemoryError`, and that's currently classified `unresponsive`. Should it count
+  as `killed` (the process died of memory exhaustion)?
+
 
 **Goal.** `m0 run <plan>` executes a plan against Trino, measures every cell the
 methodology requires and records the results. No analysis yet.
@@ -194,6 +245,13 @@ sampler.
 - A deliberate low-memory cell on `df` is classified correctly as `err_mem` or
   `killed`.
 
+**Carried over from 3a:**
+- The adapter interface also needs `metrics()`, `pool_limit_bytes()` and
+  `config_files()`.
+- The pre-run namespace check is Trino-only.
+- Result Parquet uses Trino type names. Map them to Arrow types for the cross-engine
+  diff.
+
 **Risks:**
 - **Parquet compatibility.** iceberg-rust must read what Trino writes:
   `DELTA_LENGTH_BYTE_ARRAY` strings, INT32/INT64 decimals, and `timestamp(6)` as INT64
@@ -271,6 +329,10 @@ failure.
 **Acceptance:**
 - Plans exist and pass at SF1 for A3, A5, A6, B1, B2 and B3.
 - B2 shows clean `err_mem` and `killed` outcomes, and RSS-vs-pool data is collected.
+
+**Carried over from 3a:** memory levels are expanded into blocks but not yet applied
+to the container, the pool or Trino's limits. The cgroup lookup assumes the systemd
+driver, with a cgroupfs fallback.
 
 **Risks:**
 - Two engine nodes plus infra must fit in ~11.7 GiB for A3 (2 × ~4 GiB). This may

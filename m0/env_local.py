@@ -206,3 +206,70 @@ def status_checks() -> list[Check]:
         checks.append(Check("warehouse", OK if WAREHOUSE in whs else WARN,
                             "present" if WAREHOUSE in whs else "missing; run `m0 env up`"))
     return checks
+
+
+# ---------- used by `m0 run` ----------
+
+def container_id(service: str) -> str | None:
+    """Full ID of the service's container (running or exited), if it exists."""
+    res = subprocess.run(["docker", "ps", "-a", "--no-trunc", "-q",
+                          "--filter", "label=com.docker.compose.project=m0",
+                          "--filter", f"label=com.docker.compose.service={service}"],
+                         capture_output=True, text=True, timeout=30, check=False)
+    ids = res.stdout.split()
+    return ids[0] if ids else None
+
+
+def container_state(service: str) -> dict:
+    """`docker inspect` essentials: id, running, exit code, OOMKilled, limits, image."""
+    cid = container_id(service)
+    if cid is None:
+        return {"id": None, "running": False}
+    res = subprocess.run(["docker", "inspect", cid], capture_output=True, text=True, timeout=30, check=False)
+    if res.returncode != 0:
+        return {"id": None, "running": False}
+    info = json.loads(res.stdout)[0]
+    state, host = info["State"], info["HostConfig"]
+    return {"id": cid, "running": state.get("Running", False), "status": state.get("Status"),
+            "exit_code": state.get("ExitCode"), "oom_killed": state.get("OOMKilled", False),
+            "started_at": state.get("StartedAt"), "mem_limit": host.get("Memory") or None,
+            "nano_cpus": host.get("NanoCpus") or None, "image": info.get("Image")}
+
+
+def restart_engine(engine: str) -> float:
+    """Recreate the engine container (cold JVM/process) with its current limits.
+
+    Same mechanism as `m0 env up --engine`, without the catalog write smoke test,
+    so a cold run sees no extra objects. Returns seconds until Docker reports healthy.
+    """
+    current = container_state(engine)
+    if current.get("mem_limit"):
+        os.environ["M0_ENGINE_MEM"] = str(current["mem_limit"])
+    if current.get("nano_cpus"):
+        os.environ["M0_ENGINE_CPUS"] = f"{current['nano_cpus'] / 1e9:g}"
+    others = [e for e in ENGINES if e != engine]
+    start = time.monotonic()
+    if others:
+        compose("stop", *others)
+    compose("up", "-d", "--wait", "--force-recreate", engine)
+    return time.monotonic() - start
+
+
+def stop_engine(engine: str) -> None:
+    compose("stop", engine)
+
+
+def drop_page_cache() -> float:
+    """Drop the (WSL VM) kernel page cache via a short-lived privileged container.
+
+    No sudo needed: the pinned helper image writes /proc/sys/vm/drop_caches,
+    which is the shared kernel's. Returns seconds taken.
+    """
+    image = versions.load()["images"]["cache_drop"]
+    start = time.monotonic()
+    res = subprocess.run(["docker", "run", "--rm", "--privileged", "--network", "none", image,
+                          "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"],
+                         capture_output=True, text=True, timeout=300, check=False)
+    if res.returncode != 0:
+        raise EnvError(f"page-cache drop failed: {res.stderr.strip()[-500:]}")
+    return time.monotonic() - start

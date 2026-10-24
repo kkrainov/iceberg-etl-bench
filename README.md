@@ -54,8 +54,9 @@ uv run m0 env status
 uv run m0 env down                     # stop; data is kept
 ```
 
-Planned, not implemented yet: `m0 data gen`, `m0 run`, `m0 summarize` and the
-rest of the CLI in [framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).
+Then `uv run m0 data gen --suite tpch --sf 1` (and `tpcds`, `etl`) and
+`uv run m0 run plans/phase-l-smoke.yaml`. Planned, not implemented yet: `m0 summarize`
+and the rest of the CLI in [framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).
 
 ## About Rino
 

@@ -1,0 +1,23 @@
+# Smoke plan: run after every harness change. SF1, a few queries per suite,
+# one deliberate out-of-memory cell. Format: docs/framework-design.md ("Run plans").
+name: phase-l-smoke
+phase: L
+sf: 1
+seed: 20261024
+engines: [trino]
+mem_levels: [100]
+iterations: 3          # hot runs after the first (cold) run of each query
+cold: per_block        # one engine restart + page-cache drop per engine block (fast)
+timeout_s: 600
+queries:
+  - suite: tpch
+    ids: [q01, q03, q06]
+  - suite: tpcds
+    ids: [q03, q07, q55]
+  - suite: etl
+    ids: [W1, J3]
+  # Deliberate failure: needs more than the 4 GiB per-node query memory.
+  - suite: etl
+    ids: [X1_mem]
+    iterations: 0
+    expect: err_mem

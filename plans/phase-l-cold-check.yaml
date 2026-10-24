@@ -1,0 +1,15 @@
+# Checks the cold protocol: engine restart + page-cache drop before each query's
+# first run (cold: per_query), then hot runs. SF1, two queries.
+name: phase-l-cold-check
+phase: L
+sf: 1
+seed: 20261024
+engines: [trino]
+iterations: 3
+cold: per_query
+timeout_s: 600
+queries:
+  - suite: tpch
+    ids: [q01]
+  - suite: tpcds
+    ids: [q07]

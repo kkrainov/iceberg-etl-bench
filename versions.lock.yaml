@@ -7,6 +7,9 @@ images:
   catalog: quay.io/lakekeeper/catalog:v0.14.0       # Iceberg REST catalog (Phase L only)
   catalog_db: postgres:17.6                         # Lakekeeper metadata store
   objstore: chrislusf/seaweedfs:4.48                # S3-compatible storage (Phase L only)
+  # Short-lived privileged helper for cold runs: `sync; echo 3 > /proc/sys/vm/drop_caches`.
+  # Pinned by digest because busybox tags are rebuilt.
+  cache_drop: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 
 engines:
   datafusion: "55"                                  # resolved by dfrunner/Cargo.lock (step 3)

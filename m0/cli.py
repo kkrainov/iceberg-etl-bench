@@ -6,6 +6,7 @@ code from m0.output.Exit. Only implemented commands are registered, so
 """
 
 import argparse
+import json
 import sys
 import time
 from dataclasses import asdict
@@ -133,6 +134,94 @@ def data_status(args: argparse.Namespace, expected: dict) -> Exit:
     return checks_exit(checks)
 
 
+def counts_line(counts: dict) -> str:
+    order = ("ok", "ok_mismatch", "err_mem", "err_unsupported", "err_other", "killed", "timeout", "unresponsive")
+    return ", ".join(f"{k} {counts[k]}" for k in sorted(counts, key=lambda k: order.index(k) if k in order else 99))
+
+
+def cell_line(row: dict) -> str:
+    wall = f"{row['wall_ms'] / 1000:.1f}s" if row.get("wall_ms") is not None else "-"
+    expected = " (expected)" if row.get("expected_outcome") == row["outcome"] else ""
+    line = f"{row['outcome'].upper():<15} {row['cell_id']}  {wall}  {row.get('error_line') or ''}"
+    return line[:200] + expected
+
+
+def cmd_run(args: argparse.Namespace) -> Exit:
+    from m0 import plan as plan_mod
+    from m0 import queries, runner
+
+    def emit(kind: str, payload) -> None:
+        if args.json:
+            return
+        if kind == "start":
+            print(f"run {payload['run_id']}: {payload['todo']} cells to run of {payload['planned']} planned "
+                  f"-> {payload['dir']}", flush=True)
+        elif kind == "cell":
+            print(cell_line(payload), flush=True)
+        elif kind == "event":
+            print(f"INFO  {payload}", flush=True)
+
+    try:
+        r = runner.Runner(args.plan, args.engine, args.query, args.resume, args.run_id, emit).run()
+    except (plan_mod.PlanError, queries.QueryError) as e:
+        print_checks([Check("run", FAIL, str(e))], args.json)
+        return Exit.PREREQUISITE
+    except runner.RunRefused as e:
+        print_checks([Check("run", FAIL, f"refused: {e}")], args.json)
+        return Exit.GUARD_REFUSED
+    except (runner.RunPrerequisite, env_local.EnvError) as e:
+        print_checks([Check("run", FAIL, str(e))], args.json)
+        return Exit.PREREQUISITE
+    code = Exit.HARNESS_ERROR if r.interrupted else Exit.QUERIES_FAILED if r.failed else Exit.OK
+    if args.json:
+        print(json.dumps({"run_id": r.run_id, "dir": str(r.dir), "planned": r.planned, "recorded": r.done,
+                          "executed": r.executed, "seconds": round(r.seconds, 1), "counts": r.counts,
+                          "failed": r.failed, "interrupted": r.interrupted, "exit": int(code)}, indent=2))
+        return code
+    for engine, counts in sorted(r.counts.items()):
+        print(f"{engine:<8} {counts_line(counts)}")
+    state = "interrupted; continue with --resume" if r.interrupted else "done"
+    print(f"run {r.run_id}: {r.done}/{r.planned} cells recorded, {r.executed} run now in "
+          f"{r.seconds / 60:.1f} min, {r.failed} not ok ({state})")
+    print(f"results {r.dir / 'runs.parquet'}")
+    return code
+
+
+def cmd_status(args: argparse.Namespace) -> Exit:
+    from m0 import runner, store
+
+    runs = store.list_runs()
+    if args.run in (None, "latest"):
+        if not runs:
+            print_checks([Check("status", FAIL, "no runs under results/")], args.json)
+            return Exit.PREREQUISITE
+        s = runs[-1]
+    else:
+        s = store.RunStore(args.run)
+        if not s.exists():
+            print_checks([Check("status", FAIL, f"no run {args.run!r} under results/")], args.json)
+            return Exit.PREREQUISITE
+    rows, planned, env = s.rows(), s.planned(), s.read_json("env.json")
+    pid = runner.lock_holder(s)
+    state = f"running (pid {pid})" if pid else "complete" if len(rows) >= len(planned) else "incomplete"
+    failures = [r for r in rows if r["outcome"] != "ok"]
+    last = failures[-1] if failures else None
+    counts = runner.summarize_rows(rows)
+    if args.json:
+        print(json.dumps({"run_id": s.run_id, "dir": str(s.dir), "state": state, "planned": len(planned),
+                          "recorded": len(rows), "counts": counts, "started_at": env.get("started_at"),
+                          "finished_at": env.get("finished_at"), "last_failure": last}, indent=2, default=str))
+        return Exit.OK
+    print(f"run      {s.run_id} (plan {env.get('plan', {}).get('name')}): {state}")
+    print(f"progress {len(rows)}/{len(planned)} cells; started {env.get('started_at')}, "
+          f"last end {env.get('finished_at')}")
+    for engine, c in sorted(counts.items()):
+        print(f"{engine:<8} {counts_line(c)}")
+    print(f"last failure: {cell_line(last) if last else 'none'}")
+    print(f"path     {s.dir}")
+    return Exit.OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable output")
@@ -158,6 +247,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sf", type=int, help="scale factor, one of those in datagen/expected.yaml (gen: required)")
     p.add_argument("--force", action="store_true", help="with gen: regenerate tables that already validate")
     p.set_defaults(func=cmd_data)
+
+    p = sub.add_parser("run", parents=[common], help="execute a run plan and record every cell")
+    p.add_argument("plan", help="plan file, e.g. plans/phase-l-smoke.yaml")
+    p.add_argument("--engine", action="append", help="only cells of this engine (repeatable)")
+    p.add_argument("--query", action="append", help="only this query: suite/id or id (repeatable)")
+    p.add_argument("--resume", action="store_true",
+                   help="continue a run (the latest of this plan, or --run-id), skipping recorded cells")
+    p.add_argument("--run-id", help="run ID (default <plan>-<timestamp>)")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("status", parents=[common], help="progress and last failure of a run")
+    p.add_argument("run", nargs="?", default="latest", help="run ID or latest (default)")
+    p.set_defaults(func=cmd_status)
     return parser
 
 

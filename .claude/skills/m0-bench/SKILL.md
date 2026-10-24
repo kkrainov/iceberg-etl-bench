@@ -41,8 +41,11 @@ add `--json` for machine-readable output.
 | `m0 env down --purge --yes` | Stop the stack and delete all data (ask first) |
 | `m0 data gen --suite tpch --sf 10` | Generate TPC-H/TPC-DS/`etl` tables into Iceberg through Trino (`--suite tpch\|tpcds\|etl`; `etl` needs `tpcds` at the same SF). Skips tables that validate; `--force` rebuilds. |
 | `m0 data status` | Validate every generated table against `datagen/expected.yaml`; `--suite`/`--sf` narrow it and show per-table rows, size, files, snapshot |
+| `m0 run plans/phase-l-smoke.yaml` | Execute a plan; prints non-ok cells and restarts as they happen, then outcome counts. `--query`, `--engine` filter; `--run-id` names the run; `--resume` continues it. Exit code 3 = some cells not ok (expected for the smoke plan). |
+| `m0 status` | Progress and last failure of the latest run (or `m0 status <run-id>`) |
 
-More commands (`run`, `summarize`, `triage`, …) arrive with later build steps.
+Standard loop: `doctor → env up --engine trino → data status → run → status`.
+More commands (`summarize`, `triage`, …) arrive with later build steps.
 If `m0 --help` doesn't list a command, it doesn't exist yet.
 
 **Exit codes:**
@@ -61,6 +64,13 @@ If `m0 --help` doesn't list a command, it doesn't exist yet.
 | Trino config (local) | `configs/trino/local/` |
 | Data generation SQL, expected row counts, etl parameters | `datagen/` (`expected.yaml`, `etl/*.sql`, `etl/params.yaml`) |
 | What `data gen` built (snapshot IDs, timings) | `results/datagen/<suite>_sf<N>.json` |
+| Run plans; queries (manifest + Trino SQL) | `plans/*.yaml`; `queries/manifest.yaml`, `queries/<suite>/<id>.sql` |
+| Outcome rules (engine error → class) | `m0/classify_rules.yaml`, tested with real errors in `tests/fixtures/trino_errors.yaml` |
+| One row per cell (outcome, wall, CPU, memory) | `results/<run-id>/runs.parquet` (also `cells.jsonl`) |
+| Restarts, cache drops, failures in time order | `results/<run-id>/run.log` |
+| Environment of a run (git, images, host, configs) | `results/<run-id>/env.json` |
+| One cell: SQL, Trino query info, memory timeline | `results/<run-id>/cells/<cell_id>/{query.sql, engine_stats.json, memory.csv}` |
+| Result rows of a query's first run | `results/<run-id>/rows/<cell_id>.parquet` |
 | Container logs | `docker compose -p m0 logs <service> --tail 200` (services: `objstore`, `catalog`, `catalog-db`, `catalog-migrate`, `trino`) |
 
 ## When something goes wrong
@@ -69,6 +79,8 @@ Investigate freely with read-only means: logs, `docker compose -p m0 ps`,
 `docker stats`, cgroup files, `dmesg`, engine HTTP endpoints, and reading code. Rule
 out the environment before suspecting an engine. Grep logs; don't read them whole.
 
-- Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md), [data](runbooks/data.md)
+- Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md), [data](runbooks/data.md), [run](runbooks/run.md), [troubleshooting](runbooks/troubleshooting.md)
+- `cell_id` is `<engine>.m<mem>.r<round>.<suite>.<query>.i<iteration>`; iteration 0 is
+  the first (cold) run. Query `runs.parquet` with pyarrow; grep `run.log`.
 - When you understand a new failure pattern, encode it: add a `doctor` check or a
   runbook entry, with a test where possible.

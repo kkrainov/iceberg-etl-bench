@@ -39,6 +39,10 @@ used as evidence. Its known weaknesses are summarised in the report.
 - DataFusion's memory pool limit equals Trino's `query.max-memory-per-node`.
 - Trino's JVM heap and DataFusion's process overheads both live inside the same
   container limit.
+- Phase L values: 8 GiB container, Trino heap 80% (6.4 GiB),
+  `memory.heap-headroom-per-node` 2 GiB, `query.max-memory-per-node` =
+  `query.max-memory` = **4 GiB**, so the DataFusion pool is 4 GiB. Reasons are next to
+  each value in `configs/trino/local/config.properties`.
 
 ## 3. Data
 
@@ -149,7 +153,7 @@ one hot repeat when it succeeds.
 | Wall time | Harness client clock, the same code path for every engine | Primary metric. Both engines run as long-lived servers, so client startup time is excluded (the ClickBench timing flaw). |
 | Engine elapsed | Trino query stats; DataFusion runner | Cross-check |
 | CPU-seconds | cgroup v2 `cpu.stat` `usage_usec` delta per node | Summed across nodes |
-| Peak memory | cgroup v2 `memory.peak`, reset before each query (kernel ≥ 6.12); 10 Hz `memory.current` sampling as fallback | Per node and maximum across nodes. Also the engine-reported peak (Trino peak reservation, DataFusion pool high-water mark). |
+| Peak memory | cgroup v2: the lifetime `memory.peak` when it rose during the query (exact), otherwise `memory.current` sampled at 20 Hz (a lower bound); a per-query reset needs root ([framework design](framework-design.md#peak-memory)) | Per node and maximum across nodes. Also the engine-reported peak (Trino peak reservation, DataFusion pool high-water mark), and the object store's peak (it shares the host). **Caveat:** Trino's JVM keeps its heap once grown, so its container peak tracks the heap high-water mark across the block, not one query's use. Per-query memory comparisons use the engine-reported peak; container peaks are compared only as "how close the node got to its limit". |
 | OOM kills | cgroup `memory.events` `oom_kill`, container exit code 137 | Used for outcome classification |
 | Result fingerprint | Row count + order-insensitive hash of the normalised result | See section 8 |
 | Breakdown (A5) | datafusion-distributed task metrics; Trino stage and operator stats | Scan / exchange / compute |
@@ -168,7 +172,7 @@ Classification is done by the harness from deterministic rules, never by hand.
 | `err_other` | Any other engine error, with the first error line kept |
 | `killed` | Process killed by the OS: `oom_kill` counter incremented or exit code 137 |
 | `timeout` | Exceeded the per-query timeout; the query is cancelled |
-| `unresponsive` | Health check fails after the query ends or is cancelled |
+| `unresponsive` | Health check fails after the query ends or is cancelled. This includes an engine process that exits on its own, e.g. Trino's JVM on a heap `OutOfMemoryError` (`-XX:+ExitOnOutOfMemoryError`, exit status 3). |
 
 Errors that no rule recognises are recorded as `err_other` and flagged `unrecognised`.
 Reviewing them may add a rule (with a test), after which the run is re-classified by

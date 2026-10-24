@@ -1,0 +1,29 @@
+# Query catalogue. Canonical text is Trino SQL in queries/<suite>/<id>.sql.
+# Table names use namespace placeholders, substituted from the plan's scale factor:
+#   ${tpch} -> iceberg.tpch_sf<N>   ${tpcds} -> iceberg.tpcds_sf<N>   ${etl} -> iceberg.etl_sf<N>
+# Fields:
+#   namespaces     placeholders the SQL uses (checked against the file)
+#   class          tpc | join | window | aggregation | deliberate
+#   ordered        the result has a total ORDER BY (compare in order; methodology 8)
+#   tie_ambiguous  LIMIT with possible ties on the sort keys (compare on sort keys only)
+#   rewrite        null, or the reason this query differs from its source text
+#   source         where the text comes from
+queries:
+  - {suite: tpch, id: q01, class: tpc, namespaces: [tpch], ordered: true, tie_ambiguous: false, rewrite: null,
+     source: "TPC-H v3.0.1 2.4.1, validation parameters"}
+  - {suite: tpch, id: q03, class: tpc, namespaces: [tpch], ordered: true, tie_ambiguous: false, rewrite: null,
+     source: "TPC-H v3.0.1 2.4.3, validation parameters"}
+  - {suite: tpch, id: q06, class: tpc, namespaces: [tpch], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "TPC-H v3.0.1 2.4.6, validation parameters"}
+  - {suite: tpcds, id: q03, class: tpc, namespaces: [tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+     source: "TPC-DS v3.2.0 query3.tpl, qualification parameters"}
+  - {suite: tpcds, id: q07, class: tpc, namespaces: [tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+     source: "TPC-DS v3.2.0 query7.tpl, qualification parameters"}
+  - {suite: tpcds, id: q55, class: tpc, namespaces: [tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+     source: "TPC-DS v3.2.0 query55.tpl, qualification parameters"}
+  - {suite: etl, id: W1, class: window, namespaces: [etl], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "this benchmark, B1 W1"}
+  - {suite: etl, id: J3, class: join, namespaces: [etl, tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+     source: "this benchmark, B1 J3"}
+  - {suite: etl, id: X1_mem, class: deliberate, namespaces: [etl], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "this benchmark, deliberate out-of-memory cell for smoke plans"}

@@ -4,7 +4,7 @@ import yaml
 
 from m0.paths import VERSIONS_LOCK
 
-REQUIRED_IMAGES = ("trino", "catalog", "catalog_db", "objstore")
+REQUIRED_IMAGES = ("trino", "catalog", "catalog_db", "objstore", "cache_drop")
 
 
 def load() -> dict:

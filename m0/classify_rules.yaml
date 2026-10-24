@@ -1,0 +1,28 @@
+# Outcome rules for engine errors (methodology section 7). Signals that don't come
+# from an error message are applied first, in code (m0/classify.py):
+#   killed        oom_kill counter increment, Docker OOMKilled, or a container exit code below
+#   timeout       harness timeout reached; the query was cancelled
+#   unresponsive  health check fails after the query ended or was cancelled
+# Then the first rule below whose fields all match wins. Fields are regexes:
+# `error_name` and `error_type` must match fully; `message` is searched.
+# An error no rule matches is err_other with unrecognised=true.
+# Every rule needs a test with a real error string (tests/fixtures/trino_errors.yaml).
+killed_exit_codes: [137]
+
+rules:
+  - id: trino.memory_limit
+    engine: trino
+    outcome: err_mem
+    error_name: EXCEEDED_LOCAL_MEMORY_LIMIT|EXCEEDED_GLOBAL_MEMORY_LIMIT|CLUSTER_OUT_OF_MEMORY
+  - id: trino.unsupported
+    engine: trino
+    outcome: err_unsupported
+    error_name: NOT_SUPPORTED|FUNCTION_NOT_FOUND|SYNTAX_ERROR|FUNCTION_IMPLEMENTATION_MISSING
+  - id: trino.time_limit
+    engine: trino
+    outcome: err_other
+    error_name: EXCEEDED_TIME_LIMIT|EXCEEDED_CPU_LIMIT
+  - id: trino.missing_object
+    engine: trino
+    outcome: err_other
+    error_name: (TABLE|SCHEMA|CATALOG|COLUMN)_NOT_FOUND

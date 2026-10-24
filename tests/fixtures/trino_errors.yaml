@@ -1,0 +1,76 @@
+_comment: Real errors captured from Trino 484 via the trino Python client (TrinoQueryError fields), 2026-10-24.
+errors:
+  syntax:
+    error_type: USER_ERROR
+    error_name: SYNTAX_ERROR
+    error_code: 1
+    message: 'line 1:1: mismatched input ''SELEC''. Expecting: ''ALTER'', ''ANALYZE'', ''CALL'', ''COMMENT'', ''COMMIT'', ''CREATE'', ''DEALLOCATE'', ''DELETE'', ''DENY'', ''DESC'', ''DESCRIBE'', ''DROP'',
+      ''EXECUTE'', ''EXPLAIN'', ''GRANT'', ''INSERT'', ''MERGE'', ''PREPARE'', ''REFRESH'', ''RESET'', ''REVOKE'', ''ROLLBACK'', ''SET'', ''SHOW'', ''START'', ''TRUNCATE'', ''UPDATE'', ''USE'', ''WITH'',
+      <query>'
+    exception: io.trino.sql.parser.ParsingException
+    expect: err_unsupported
+  function:
+    error_type: USER_ERROR
+    error_name: FUNCTION_NOT_FOUND
+    error_code: 6
+    message: 'line 1:8: Function ''no_such_fn'' not registered'
+    exception: io.trino.spi.TrinoException
+    expect: err_unsupported
+  not_supported:
+    error_type: USER_ERROR
+    error_name: NOT_SUPPORTED
+    error_code: 13
+    message: This connector does not support inserts
+    exception: io.trino.spi.TrinoException
+    expect: err_unsupported
+  table:
+    error_type: USER_ERROR
+    error_name: TABLE_NOT_FOUND
+    error_code: 46
+    message: 'line 1:15: Table ''iceberg.tpch_sf1.nope'' does not exist'
+    exception: io.trino.spi.TrinoException
+    expect: err_other
+  div0:
+    error_type: USER_ERROR
+    error_name: DIVISION_BY_ZERO
+    error_code: 8
+    message: Division by zero
+    exception: io.trino.spi.TrinoException
+    expect: err_other
+    unrecognised: true
+  cast:
+    error_type: USER_ERROR
+    error_name: INVALID_CAST_ARGUMENT
+    error_code: 9
+    message: Cannot cast 'x' to INT
+    exception: io.trino.spi.TrinoException
+    expect: err_other
+    unrecognised: true
+  timelimit:
+    error_type: INSUFFICIENT_RESOURCES
+    error_name: EXCEEDED_TIME_LIMIT
+    error_code: 131075
+    message: Query exceeded maximum time limit of 1.00s
+    exception: io.trino.spi.TrinoException
+    expect: err_other
+  global_mem:
+    error_type: INSUFFICIENT_RESOURCES
+    error_name: EXCEEDED_GLOBAL_MEMORY_LIMIT
+    error_code: 131073
+    message: Query exceeded distributed user memory limit of 64MB
+    exception: io.trino.ExceededMemoryLimitException
+    expect: err_mem
+  local_mem:
+    error_type: INSUFFICIENT_RESOURCES
+    error_name: EXCEEDED_LOCAL_MEMORY_LIMIT
+    error_code: 131079
+    message: 'Query exceeded per-node memory limit of 4GB [Allocated: 4.00GB, Delta: 13.01kB, Top Consumers: {HashAggregationOperator=3.99GB, ScanFilterAndProjectOperator-ConnectorPageSource=8MB, PagePartitioner=2.00MB}]'
+    exception: io.trino.ExceededMemoryLimitException
+    expect: err_mem
+  local_mem_session:
+    error_type: INSUFFICIENT_RESOURCES
+    error_name: EXCEEDED_LOCAL_MEMORY_LIMIT
+    error_code: 131079
+    message: 'Query exceeded per-node memory limit of 16MB [Allocated: 13.55MB, Delta: 2.50MB, Top Consumers: {TableScanOperator-ConnectorPageSource=8MB, HashAggregationOperator=5.55MB, PagePartitioner=544B}]'
+    exception: io.trino.ExceededMemoryLimitException
+    expect: err_mem
