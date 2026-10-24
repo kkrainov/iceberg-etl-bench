@@ -1,6 +1,8 @@
 # Outcome rules for engine errors (methodology section 7). Signals that don't come
 # from an error message are applied first, in code (m0/classify.py):
-#   killed        oom_kill counter increment, Docker OOMKilled, or a container exit code below
+#   killed        oom_kill counter increment, Docker OOMKilled, a container exit code in
+#                 killed_exit_codes, or the engine exiting by itself on memory exhaustion
+#                 (memory_exit_codes; Trino's JVM uses -XX:+ExitOnOutOfMemoryError -> 3)
 #   timeout       harness timeout reached; the query was cancelled
 #   unresponsive  health check fails after the query ended or was cancelled
 # Then the first rule below whose fields all match wins. Fields are regexes:
@@ -8,6 +10,8 @@
 # An error no rule matches is err_other with unrecognised=true.
 # Every rule needs a test with a real error string (tests/fixtures/trino_errors.yaml).
 killed_exit_codes: [137]
+memory_exit_codes:
+  trino: [3]
 
 rules:
   - id: trino.memory_limit

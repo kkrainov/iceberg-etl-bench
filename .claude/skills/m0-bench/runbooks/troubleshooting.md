@@ -20,7 +20,7 @@ Symptom → how to confirm → fix. Rule out the environment first (`m0 doctor`,
 |---|---|---|
 | `err_mem` with `EXCEEDED_LOCAL_MEMORY_LIMIT` | `cells/<id>/engine_stats.json` (`failureInfo.message` lists the top memory consumers) | Clean Trino memory error at `query.max-memory-per-node` (4 GiB). A result, not a fault. |
 | `killed`: error line starts `container exit status 137` or `oom_kill +N` | `docker inspect m0-trino-1 --format '{{.State.OOMKilled}} {{.State.ExitCode}}'`, `dmesg \| grep -i oom` (may need the user), `cells/<id>/memory.csv` | The kernel killed the engine at the container limit, or someone ran `docker kill`. The runner restarts the engine automatically (`INFO restarted …`). |
-| `unresponsive`, `container not running (exit status 3)` | `docker compose -p m0 logs trino --tail 100 \| grep -i OutOfMemoryError` | Trino's JVM hit a heap OutOfMemoryError and exited (`-XX:+ExitOnOutOfMemoryError`): untracked memory outgrew the 2 GiB heap headroom. Restarted automatically. |
+| `killed` with `error_class` `memory_self_exit` (exit status 3) | `docker compose -p m0 logs trino --tail 100 \| grep -i OutOfMemoryError` | Trino's JVM hit a heap OutOfMemoryError and exited (`-XX:+ExitOnOutOfMemoryError`): untracked memory outgrew the 2 GiB heap headroom. Restarted automatically. |
 | `timeout` | `error_line` is `USER_CANCELED` after `timeout_s` | The query ran longer than the plan's timeout and was cancelled. |
 | `err_other`, `unrecognised = true` | `error_line`, `engine_stats.json` | No rule in `m0/classify_rules.yaml` matches. Understand it; if it's a known class, add a rule plus a real error string in `tests/fixtures/trino_errors.yaml`. |
 | `err_other` `TABLE_NOT_FOUND` | `m0 data status` | Data missing or dropped. |

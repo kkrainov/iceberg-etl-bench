@@ -170,9 +170,9 @@ Classification is done by the harness from deterministic rules, never by hand.
 | `err_mem` | Clean memory error: DataFusion `ResourcesExhausted`; Trino `EXCEEDED_*_MEMORY_LIMIT` |
 | `err_unsupported` | Planning or feature error (unsupported syntax or function) |
 | `err_other` | Any other engine error, with the first error line kept |
-| `killed` | Process killed by the OS: `oom_kill` counter incremented or exit code 137 |
+| `killed` | Engine process died of memory exhaustion: killed by the OS (`oom_kill` counter incremented, exit status 137), or exited by itself on running out of memory (Trino's JVM on a heap `OutOfMemoryError`, `-XX:+ExitOnOutOfMemoryError`, exit status 3). `error_class` tells the two apart (`oom_killer` vs `memory_self_exit`). |
 | `timeout` | Exceeded the per-query timeout; the query is cancelled |
-| `unresponsive` | Health check fails after the query ends or is cancelled. This includes an engine process that exits on its own, e.g. Trino's JVM on a heap `OutOfMemoryError` (`-XX:+ExitOnOutOfMemoryError`, exit status 3). |
+| `unresponsive` | Health check fails after the query ends or is cancelled, for any reason other than memory exhaustion (process hung, or exited for another reason). |
 
 Errors that no rule recognises are recorded as `err_other` and flagged `unrecognised`.
 Reviewing them may add a rule (with a test), after which the run is re-classified by

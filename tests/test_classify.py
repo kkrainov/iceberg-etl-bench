@@ -54,8 +54,14 @@ def test_timeout_beats_cancel_error():
 def test_unresponsive_after_query():
     c = classify(Signals("trino", healthy_after=False))
     assert c.outcome == "unresponsive" and "health check failed" in c.error_line
+    c = classify(Signals("trino", container_running=False, container_exit_code=1, healthy_after=False))
+    assert c.outcome == "unresponsive" and "exit status 1" in c.error_line
+
+
+def test_jvm_out_of_memory_exit_is_killed():
+    # -XX:+ExitOnOutOfMemoryError: the process dies of memory exhaustion, like an OS kill.
     c = classify(Signals("trino", container_running=False, container_exit_code=3, healthy_after=False))
-    assert c.outcome == "unresponsive" and "exit status 3" in c.error_line
+    assert c.outcome == "killed" and c.error_class == "memory_self_exit" and "exit status 3" in c.error_line
 
 
 def test_unknown_error_is_flagged():

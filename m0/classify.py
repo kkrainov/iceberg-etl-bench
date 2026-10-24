@@ -86,6 +86,10 @@ def classify(s: Signals, rules: dict | None = None) -> Classification:
         why = (f"oom_kill +{s.oom_kills}" if s.oom_kills else "container OOMKilled" if s.container_oom_killed
                else f"container exit status {s.container_exit_code}")
         return Classification("killed", "oom_killer", f"{why}; {detail}".rstrip("; "))
+    memory_codes = set(rules.get("memory_exit_codes", {}).get(s.engine, []))
+    if not s.container_running and s.container_exit_code in memory_codes:
+        why = f"engine exited on memory exhaustion (exit status {s.container_exit_code})"
+        return Classification("killed", "memory_self_exit", f"{why}; {detail}".rstrip("; "))
     if s.timed_out:
         return Classification("timeout", "harness_timeout", detail or "harness timeout; query cancelled")
     if not s.healthy_after:

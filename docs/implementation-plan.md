@@ -156,9 +156,9 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 - **Trino container peak isn't per-query.** The JVM keeps its grown heap, so after a
   heavy query every later cell shows ~7.4 GiB. Methodology section 6 now says
   per-query memory comparisons use engine-reported peaks.
-- **Open methodology question (for the user):** Trino's JVM exits by itself on a heap
-  `OutOfMemoryError`, and that's currently classified `unresponsive`. Should it count
-  as `killed` (the process died of memory exhaustion)?
+- **JVM out-of-memory exits.** Trino's JVM exits by itself on a heap
+  `OutOfMemoryError`. The user decided (2026-10-24) to count that as `killed`, with
+  `error_class=memory_self_exit` to tell it apart from an OS kill (`oom_killer`).
 
 
 **Goal.** `m0 run <plan>` executes a plan against Trino, measures every cell the
