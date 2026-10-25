@@ -31,7 +31,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 2 | Data generation | M | ✅ done |
 | 3a | Measurement core with Trino | M | ✅ done |
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
-| 4 | Analysis: diff, stats, summaries, full query catalogue | M | next |
+| 3c | Simplify result storage (JSON only, fewer artifacts) | S | next |
+| 4 | Analysis: diff, stats, summaries, full query catalogue | M | |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
@@ -327,6 +328,67 @@ sampler.
 - Iceberg REST catalog support in iceberg-rust against Lakekeeper (auth, warehouse
   parameter).
 - Rust build time in WSL. Cache target directories.
+
+## Step 3c: simplify result storage
+
+**Goal.** A run records what was tested, how it was configured and what was measured,
+in plain JSON, and nothing more. Requested by the user on 2026-10-25: the step 3a/3b
+store (Parquet tables, per-cell directories, separate environment and plan snapshots)
+is more than the benchmark needs.
+
+**Today** (`results/<run-id>/`, from step 3a):
+- `cells.jsonl` plus `runs.parquet` (47 columns, rebuilt from the JSON lines);
+- `cells.json` (planned cells), `plan.yaml`, `env.json`, `run.log`;
+- `cells/<cell_id>/` per cell: `query.sql`, `engine_stats.json`, `memory.csv`;
+- `rows/<cell_id>.parquet` per first run.
+
+**Target layout:**
+
+```text
+results/<run-id>/
+├── run.json       what and how: plan name and resolved settings, git SHA (+ dirty),
+│                  pinned versions (images, engines), key engine settings + config
+│                  hashes, host summary, start/end
+├── cells.jsonl    one line per cell, appended as it finishes (the only measurements
+│                  file; makes --resume and crash safety work): test identity,
+│                  measurements, outcome, error line, events (restart, cache drop,
+│                  recovery)
+├── answers.jsonl  result rows of the first run per engine × query, capped (for the
+│                  cross-engine correctness diff)
+└── diag/          only when asked for (`m0 repro --diag`, or a plan flag): engine
+                   stats/plan and memory timeline for chosen cells
+```
+
+**Scope:**
+- **Remove** `runs.parquet`, `cells.json`, `plan.yaml`, `env.json`, `run.log`, the
+  per-cell `cells/` directories and `rows/*.parquet`. Fold what's still needed into
+  the three files above.
+  - Planned cells are re-derived from the plan, which is deterministic.
+  - Restart and recovery events become fields or event lines in `cells.jsonl`.
+- **Trim the cell record** to fields that analysis, the report or the agent actually
+  use. Today there are 47 columns. Keep the time-breakdown numbers step 4 needs
+  (scan / exchange / compute) as a few extracted fields, not raw engine stats.
+- **dfrunner returns JSON results** instead of Arrow IPC (results are small). Drop the
+  `pyarrow` dependency from the harness.
+- **Results retention:** `m0 results list` and `m0 results prune` (keep named runs,
+  delete scratch runs) or an equivalent simple convention. Delete the current scratch
+  runs (`killtest`, `cold-check-1`, `smoke-3b`, `phase-l-smoke-*`). Re-run the smoke
+  plan to create a fresh reference run.
+- **Data fingerprints** (`results/verify/`) and the data-generation manifests
+  (`results/datagen/`) are already JSON. Keep them as they are.
+- Update `docs/framework-design.md` (results schema, layout), the skill's file map,
+  `runbooks/run.md`, and the tests.
+
+**Acceptance:**
+- The two-engine smoke plan produces only `run.json`, `cells.jsonl` and
+  `answers.jsonl`, plus `diag/` when asked.
+- `--resume` still works.
+- `m0 status` works.
+- `pyarrow` is no longer a dependency.
+- Total test count doesn't drop, apart from tests of removed code.
+
+**Note for step 4:** analysis reads `cells.jsonl` with the standard library (or
+DuckDB ad hoc). There's no dataframe dependency unless step 4 shows a real need.
 
 ## Step 4: analysis, plus the full query catalogue
 
