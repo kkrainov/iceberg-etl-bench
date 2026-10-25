@@ -39,6 +39,7 @@ class Query:
     rewrite: str | None
     source: str
     datafusion_override: str | None = None  # reason for queries/overrides/datafusion/<suite>/<id>.sql
+    sort_keys: tuple[int, ...] = ()  # result columns (1-based) of the final ORDER BY, in order
 
     @property
     def key(self) -> str:
@@ -65,9 +66,14 @@ def load_manifest(path=MANIFEST) -> dict[str, Query]:
     out = {}
     for e in entries:
         q = Query(e["suite"], str(e["id"]), e["class"], tuple(e["namespaces"]), bool(e["ordered"]),
-                  bool(e["tie_ambiguous"]), e.get("rewrite"), e["source"], e.get("datafusion_override"))
+                  bool(e["tie_ambiguous"]), e.get("rewrite"), e["source"], e.get("datafusion_override"),
+                  tuple(int(k) for k in e.get("sort_keys") or ()))
         if not ID_RE.fullmatch(q.id) or q.suite not in NAMESPACES:
             raise QueryError(f"bad query id or suite: {q.key}")
+        if q.sort_keys and (not q.ordered or min(q.sort_keys) < 1 or len(set(q.sort_keys)) != len(q.sort_keys)):
+            raise QueryError(f"{q.key}: sort_keys need ordered: true and distinct 1-based column positions")
+        if q.tie_ambiguous and not q.sort_keys:
+            raise QueryError(f"{q.key}: tie_ambiguous needs sort_keys (the columns compared)")
         has_file = q.override_path("datafusion").is_file()
         if bool(q.datafusion_override) != has_file:
             raise QueryError(f"{q.key}: datafusion override file {'exists' if has_file else 'missing'} but the "

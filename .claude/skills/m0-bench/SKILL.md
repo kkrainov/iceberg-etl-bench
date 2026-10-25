@@ -45,15 +45,24 @@ add `--json` for machine-readable output.
 | `m0 data verify --engine df` | Fingerprint every table through an engine and compare with Trino's (`m0 data verify --engine trino` first, with Trino up). Lists every table or column that differs or can't be read. Exit code 3 = differences (findings, not errors). |
 | `m0 run plans/phase-l-smoke.yaml` | Execute a plan (the smoke plan runs `trino` and `df` in ABBA order and switches engines itself); prints non-ok cells and restarts as they happen, then outcome counts. `--query`, `--engine` filter; `--run-id` names the run; `--resume` continues it. Exit code 3 = some cells not ok (expected for the smoke plan). |
 | `m0 status` | Progress and last failure of the latest run (or `m0 status <run-id>`) |
+| `m0 summarize` | A finished run in at most 40 lines: outcomes, answer diffs against Trino, suite totals, ratios with 95% CIs, slowest queries, every failure group, every mismatch. `m0 summarize <run-id> --json` for everything. Exit code 3 = some cells not ok. |
+| `m0 compare <run-a> <run-b>` | Run B against run A per engine (B/A times, moved queries, outcome changes, changed images and configs) |
+| `m0 explain <run-id> <engine> <query>` | Re-run one query on the live engine; saves the plan with metrics under the run's `diag/`, prints the top operators. Needs the engine up. |
+| `m0 logs <run-id> <engine> <query>` | Engine log lines during that query's cells (`--grep`, `--tail`); says when the container was recreated and the lines are gone |
 | `m0 results list` | Every run under `results/` with state, cells, size, and whether `results/keep.txt` keeps it |
 | `m0 results prune` | Dry run: which runs not kept would be deleted. `--yes` deletes them, `--keep <id>` spares one more. Ask the user before `--yes` unless they asked for the cleanup. |
 
 Engines now: `trino` (Trino 484) and `df` (DataFusion 55 in `dfrunner single`). `dfd`
 arrives with step 5.
 
-Standard loop: `doctor → env up --engine trino → data status → run → status`.
-More commands (`summarize`, `triage`, …) arrive with later build steps.
-If `m0 --help` doesn't list a command, it doesn't exist yet.
+Standard loop: `doctor → env up --engine trino → data status → run → status →
+summarize → (explain / logs / compare) → results prune`. Analysis: runbook
+[analyse](runbooks/analyse.md). More commands (`triage`, `repro`, `diff`, …) arrive
+with later build steps. If `m0 --help` doesn't list a command, it doesn't exist yet.
+
+Plans: `plans/phase-l-smoke.yaml` (minutes, after every harness change),
+`plans/phase-l-a1a2-sf1.yaml` (all 22 TPC-H + 99 TPC-DS queries, ~25 min),
+`plans/phase-l-a1a2-sf10.yaml` (the Phase L main run, hours).
 
 **Exit codes:**
 - exit code 0: ok
@@ -81,6 +90,9 @@ If `m0 --help` doesn't list a command, it doesn't exist yet.
 | What and how a run ran: plan (resolved), git, versions, image digests, engine settings and config hashes, host, start/end | `results/<run-id>/run.json` |
 | Result rows of the first completed run per engine × query (capped, canonical JSON) | `results/<run-id>/answers.jsonl` |
 | One cell's SQL, engine stats (Trino query info / dfrunner stats with plan + metrics), memory timeline; only when the plan sets `diag` | `results/<run-id>/diag/<cell_id>/{query.sql, stats.json, memory.csv}` |
+| `m0 explain` output: SQL, plan with metrics, operators, engine stats | `results/<run-id>/diag/explain.<engine>.<suite>.<id>/{query.sql, plan.txt, operators.json, stats.json}` |
+| Answer comparison rules (differ), statistics | `m0/differ.py`, `m0/stats.py` (methodology sections 8 and 9) |
+| Query order keys and tie flags used by the differ | `queries/manifest.yaml` (`ordered`, `sort_keys`, `tie_ambiguous`) |
 | Runs that `m0 results prune` keeps (run IDs or globs) | `results/keep.txt` |
 | Container logs | `docker compose -p m0 logs <service> --tail 200` (services: `objstore`, `catalog`, `catalog-db`, `catalog-migrate`, `trino`, `df`) |
 | dfrunner live state (versions, pool, running queries) | `curl -s 127.0.0.1:9000/status`; one query: `curl -s 127.0.0.1:9000/queries/<engine_query_id>` |
@@ -91,7 +103,7 @@ Investigate freely with read-only means: logs, `docker compose -p m0 ps`,
 `docker stats`, cgroup files, `dmesg`, engine HTTP endpoints, and reading code. Rule
 out the environment before suspecting an engine. Grep logs; don't read them whole.
 
-- Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md), [data](runbooks/data.md), [run](runbooks/run.md), [troubleshooting](runbooks/troubleshooting.md)
+- Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md), [data](runbooks/data.md), [run](runbooks/run.md), [analyse](runbooks/analyse.md), [troubleshooting](runbooks/troubleshooting.md)
 - `cell_id` is `<engine>.m<mem>.r<round>.<suite>.<query>.i<iteration>`; iteration 0 is
   the first (cold) run. Query `cells.jsonl` with a short Python one-liner (runbook
   [run](runbooks/run.md)); don't print it whole.

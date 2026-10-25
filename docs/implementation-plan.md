@@ -32,8 +32,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 3a | Measurement core with Trino | M | ✅ done |
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
 | 3c | Simplify result storage (JSON only, fewer artifacts) | S | ✅ done |
-| 4 | Analysis: diff, stats, summaries, full query catalogue | M | next |
-| 4b | Investigation helpers and deliberate failures | S | |
+| 4 | Analysis: diff, stats, summaries, full query catalogue | M | ✅ done |
+| 4b | Investigation helpers and deliberate failures | S | next |
 | 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
 | L | Phase L execution and Gate L | M | |
@@ -423,7 +423,7 @@ written only for cells named by the plan key `diag`.
   threads and includes S3 waits. The breakdown compares within an engine; across
   engines only roughly.
 
-## Step 4: analysis, plus the full query catalogue
+## Step 4: analysis, plus the full query catalogue ✅
 
 **Carried over from 3b:**
 - **Decimal types differ.** Trino `sum` returns decimal(38,s) and `avg` rounds to the
@@ -462,6 +462,67 @@ written only for cells named by the plan key `diag`.
 - `summarize` output stays under 40 lines.
 - Every result is diffed. Each mismatch is classified or recorded as a finding.
 
+**Done (2026-10-25).** Evidence, re-checked by the lead agent:
+- Run `phase-l-a1a2-sf1-20261025-123604Z` (plan `phase-l-a1a2-sf1`, 2 rounds × 3 hot,
+  `per_block` cold): 2,000 cells in 23.3 min. `trino` ok 1000. `df` ok 976,
+  ok_mismatch 16, err_mem 8 (all eight are tpcds/q72).
+- `m0 summarize` prints 24 lines. df vs trino geomean: TPC-H 1.74× [1.67–1.82],
+  TPC-DS 1.73× [1.70–1.76] (above 1: df faster). Totals over common queries: TPC-H
+  6.9 s vs 3.8 s, TPC-DS 32.7 s vs 19.5 s.
+- Correctness: 124 df answers diffed. 122 match, 2 mismatch (tpcds q61, q66, both
+  decimal division precision), no `no_reference`, no `unverified`.
+- `m0 compare` against the 3c smoke run, `m0 explain` (df q72, df q21, trino q64) and
+  `m0 logs` work. `explain` with the engine down exits 2.
+- Tests: 136 → 185.
+
+**What was built:** `m0/{differ,stats,analysis,explain,logs}.py`; the commands
+`summarize`, `compare`, `explain`, `logs`; manifest field `sort_keys`; 22 TPC-H and
+103 TPC-DS query files (q14, q23, q24, q39 are split into `a`/`b`); plans
+`phase-l-a1a2-sf1` and `phase-l-a1a2-sf10` (SF10 not run yet); `runbooks/analyse.md`.
+- Sources: TPC-DS from trinodb/trino@aab079cf `testing/trino-benchmark-queries`
+  (qualification parameters); TPC-H from apache/datafusion@36f39355
+  `benchmarks/queries` (validation parameters), with q04 (DATE literal) and q15 (view
+  as WITH) rewritten for Trino. Trino's q12, q20, q84, q98 contained a literal
+  `${database}.${schema}.` inside a column alias; fixed here and worth reporting
+  upstream.
+- DataFusion overrides, each with a reason in the manifest: q49, q66, q74 (quoted
+  upper-case aliases: DataFusion's quoted identifiers are case-sensitive); q39a, q39b
+  (aliases for two CASTs: "Projections require unique expression names"); q84
+  (`concat` → `||`, because DataFusion's `concat` skips NULLs and Trino's returns
+  NULL; `||` has Trino's semantics, so the meaning is unchanged).
+- `ok_mismatch` is derived at analysis time from the diff; `cells.jsonl` is never
+  rewritten, so a differ fix needs no re-run.
+
+**Deviations, awaiting the user's confirmation:**
+- **Decimal rule.** Compared at the lower of the two declared scales (the more
+  precise side rounded half up), and one unit in the last place is allowed. The plan
+  said "at Trino's scale". Reason: DataFusion keeps scale 8 after division and
+  truncates; Trino keeps up to 20 and rounds. Every normalisation used is counted in
+  `summarize` (`decimal_round`, `decimal_scale`, `decimal_lower_scale`,
+  `decimal_ulp`). Methodology section 8 is updated.
+- **NULL order.** Ordered answers that differ only in where rows with a NULL sort key
+  sit count as the same order (DataFusion puts NULLs first in DESC, Trino last).
+  Applied on q34 and q71.
+
+**Findings (to record in `findings/` in step 4b):**
+- F4: df tpcds/q72 is `err_mem` at SF1 with a 4 GiB pool. A hash join produces 56 M
+  rows and its build side reaches 2.8 GB with `can spill: false`. Trino finishes it.
+  Likely join order (A6).
+- F5: df join-order outliers: tpcds q21 (0.32×), q39a/b (~0.55×), q99, q58, q82. In
+  q21, df joins inventory with warehouse first (11.7 M rows) and the selective date
+  filter last.
+- F6: DataFusion decimal arithmetic differs from Trino's (`avg` scale 6, division
+  scale 8, truncation). q61 and q66 still differ after normalisation.
+- F7: dialect gaps a Trino drop-in must close: case-sensitive quoted identifiers,
+  `concat` NULL semantics, duplicate projection names, NULL ordering in DESC.
+
+**Open, carried forward:**
+- tpch q11's FRACTION is fixed at the SF1 value 0.0001. At SF10 the spec uses
+  0.00001. Fix before the SF10 run (Phase L), e.g. an SF-derived placeholder.
+- The tie check ran on visible sort keys only. q47, q57, q89 sort first by an
+  expression; checked by hand at the cut, no ties. Re-check at SF10.
+- `df` `scan_ms` is still null (from 3c); decide in step 5.
+
 ## Step 4b: investigation helpers
 
 **Carried over from 3b:**
@@ -469,6 +530,8 @@ written only for cells named by the plan key `diag`.
   that fails cleanly on both engines, e.g. the full window sort from F3, and check its
   behaviour on Trino.
 - Record findings F1–F3 in `findings/`.
+
+**Carried over from 4:** record F4–F7 in `findings/` too.
 
 **Scope:**
 - Commands: `m0 triage`, `m0 repro`, `m0 bisect-mem`, `m0 diff`, `m0 sql`.

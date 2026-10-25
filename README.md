@@ -64,8 +64,16 @@ correctness check). `uv run m0 status` shows its progress, `uv run m0 results li
 lists runs, and `uv run m0 results prune --yes` deletes runs not named in
 `results/keep.txt`.
 `uv run m0 data verify --engine df` checks that DataFusion reads every table with the
-same values as Trino. Planned, not implemented yet: `m0 summarize`
-and the rest of the CLI in [framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).
+same values as Trino.
+
+`uv run m0 summarize` reports a finished run in at most 40 lines: outcomes, each
+engine's answers compared with Trino's, suite totals and ratios with bootstrap
+confidence intervals, the slowest queries and every failure. `m0 compare <run-a>
+<run-b>` compares two runs, `m0 explain <run-id> <engine> <query>` saves one query's
+plan with metrics, and `m0 logs <run-id> <engine> <query>` shows the engine's log lines
+for that query. `plans/phase-l-a1a2-sf1.yaml` runs all 22 TPC-H and 99 TPC-DS queries.
+Still planned: `m0 triage`, `repro`, `diff`, `sql`, `report` and the rest of the CLI in
+[framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).
 
 ## About Rino
 

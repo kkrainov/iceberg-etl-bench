@@ -70,7 +70,7 @@ and the run directory.
 |---|---|
 | `run.json` | Run ID, plan file, `plan_hash` and the resolved plan, git SHA and dirty flag, `versions.lock.yaml` and image digests, per engine its version, key settings and config-file hashes, container limits, host, WSL config, start/end, one entry per `--resume` |
 | `cells.jsonl` | One line per finished cell: identity, `cold`, `events` (restart with reason and seconds, cache drop), wall/CPU/memory, `planning_ms`, `scan_ms`/`exchange_ms`/`compute_ms`, outcome, `error_line`, `engine_query_id`, `rows`, `answer` |
-| `answers.jsonl` | Result rows (canonical JSON, capped) of the first completed run per engine × query, for the step 4 differ |
+| `answers.jsonl` | Result rows (canonical JSON, capped) of the first completed run per engine × query; `m0 summarize` diffs them against Trino's |
 | `diag/<cell_id>/` | Only for cells the plan's `diag` selects (`diag: true`, or a list like `[tpch/q01]`): `query.sql`; `stats.json` (Trino: trimmed query info with `operatorTime` and `queryStats`; df: dfrunner stats with `pool`, `error`, `metrics.operators` and `metrics.plan`); `memory.csv` (`t_ms,engine_bytes,objstore_bytes` at 20 Hz) |
 
 Planned cells aren't stored; they come from the plan in `run.json`. Without `diag`,
@@ -103,7 +103,8 @@ uv run python -c "import json; [print(r['cell_id'], r['outcome'], r['wall_ms'], 
   query); `peak_mem_bytes` (container) minus it is memory the pool doesn't track.
   `engine_cpu_s` is dfrunner's process CPU (getrusage) during the query. dfrunner has no
   JVM, so its container memory falls back after each query, unlike Trino's.
-- `ok` currently means "completed"; result comparison arrives with step 4.
+- `ok` in `cells.jsonl` means "completed". `m0 summarize` compares the answers and shows
+  a completed cell whose answer differs as `ok_mismatch` (runbook [analyse](analyse.md)).
 - `scan_ms`, `exchange_ms`, `compute_ms` are operator time summed over threads, not
   wall time. df `scan_ms` is null: the Iceberg scan has no timer.
 

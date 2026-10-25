@@ -209,14 +209,36 @@ survived an `err_mem`, `killed` or `unresponsive` event.
   - Column names are compared by position.
   - `CHAR` values have trailing spaces stripped.
   - Timestamps are converted to UTC.
-  - Decimals are compared at the query's declared scale.
-- **Floats:** equal if `|a−b| ≤ 1e-9` or `|a−b| / max(|a|,|b|) ≤ 1e-6`.
+  - Decimals are compared at the reference column's scale, or at the other engine's
+    scale where that is lower. The more precise value is rounded half up to that
+    scale. The two may then differ by one unit in the last place. The SQL standard
+    leaves the result scale of a division, and rounding versus truncation, to the
+    implementation, and the engines differ:
+    - Trino's `avg` of a decimal rounds to the input scale; DataFusion's has scale 6.
+    - DataFusion's decimal division keeps scale 8 where Trino keeps up to 20.
+    - Trino rounds a division result half up; DataFusion truncates it.
+
+    A larger difference is a mismatch, also when it comes from these rules (for
+    example truncation errors summed over many rows).
+- **Floats:** equal if `|a−b| ≤ 1e-9` or `|a−b| / max(|a|,|b|) ≤ 1e-6`. A decimal
+  compared with a float uses the same rule.
 - **NULL handling:** NULL equals NULL.
 - **Ordering:**
-  - Queries without a total `ORDER BY` are compared as multisets.
-  - Ordered queries must also match in order, but only on the `ORDER BY` keys.
+  - Queries without a final `ORDER BY` are compared as multisets.
+  - Ordered queries must also match in order, but only on the `ORDER BY` keys that
+    are result columns (`sort_keys` in the query manifest).
+  - Where NULLs sort is implementation-defined in SQL (Trino puts them last; DataFusion
+    puts them first in a descending order). If the order differs only in where rows
+    with a NULL sort key are, it counts as the same order.
   - `LIMIT` queries with ties on the sort keys are marked `tie_ambiguous` in the
-    query manifest and compared only on the sort-key columns.
+    query manifest and compared only on the sort-key columns. A LIMIT query is
+    marked when, on Trino, the last kept row and the next row tie on the sort keys and
+    differ elsewhere. No TPC-H or TPC-DS query does at SF1 or SF10.
+- **Truncated answers:** each engine keeps at most `result_rows_cap` rows per answer.
+  Different row counts are a mismatch. With equal counts, an ordered answer is
+  compared on the kept rows; an unordered one is `unverified`.
+- **Recorded outcomes are not rewritten.** `cells.jsonl` records `ok` for a completed
+  cell. Analysis derives `ok_mismatch` from the diff, so a differ fix needs no re-run.
 - **Rewrites:** queries that needed a per-engine rewrite are listed with the reason
   (dialect, unsupported function). They count towards correctness only if their
   results match.

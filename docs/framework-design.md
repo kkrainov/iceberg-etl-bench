@@ -55,8 +55,8 @@
 | Data generator | SQL + Python | `datagen/*.sql`, run through Trino: CTAS from the `tpch`/`tpcds` connectors, then the `etl.*` derived tables |
 | Metrics sampler | Python | Reads cgroup v2 files of the engine and `objstore` containers without root: `cpu.stat` deltas, `memory.current` sampled at 20 Hz, lifetime `memory.peak`, `memory.events` `oom_kill`. See [Peak memory](#peak-memory). |
 | Classifier | Python | Applies the outcome rules from methodology section 7. Error-pattern table in `m0/classify_rules.yaml`, unit-tested. |
-| Differ | Python | Normalises results and compares them to the reference (methodology section 8). Stores fingerprints, and diffs only when they differ. |
-| Stats and report | Python + matplotlib | Medians, geomeans, bootstrap CIs, charts, Markdown report from `docs/report-template.md` |
+| Differ | Python | `m0/differ.py`: normalises each engine's answer from `answers.jsonl` and compares it with Trino's (methodology section 8). Computed on demand by `summarize` and `compare`; nothing is stored. |
+| Stats and report | Python (+ matplotlib for the report) | `m0/stats.py` (standard library): medians, CV, totals over common queries, geomeans, bootstrap CIs. Charts and the Markdown report from `docs/report-template.md` come with step 6. |
 | Skill | Markdown | `.claude/skills/m0-bench/SKILL.md` plus runbooks; explains the harness and how to analyse results |
 
 ## The `m0` CLI: an interface designed for the agent
@@ -81,10 +81,10 @@ Rules every command follows:
 | `m0 run <plan.yaml> [--engine E] [--query Q] [--resume] [--run-id ID]` | Executes the plan's cells (or those matching `--engine`/`--query`, both repeatable) into `results/<run-id>/`. Prints only non-`ok` cells and restarts as they happen, then outcome counts per engine. An existing run ID needs `--resume` (exit code 4 otherwise, also if the plan file changed); `--resume` without `--run-id` continues the latest run of that plan. |
 | `m0 status [<run-id>\|latest]` | Progress, outcome counts, and the last failure in one line |
 | `m0 results list\|prune [--keep ID] [--yes]` | Lists runs under `results/`; `prune` deletes runs not named in `results/keep.txt` or `--keep` (dry run without `--yes`). See [Results](#results). |
-| `m0 summarize <run-id\|latest>` | Outcome counts per engine, suite totals and ratios, top 10 slowest relative queries, every non-`ok` cell with a one-line reason |
-| `m0 compare <run-a> <run-b>` | Before/after comparison, e.g. a new upstream version or `dfd-jo` vs `dfd` |
-| `m0 explain <run-id> <engine> <query>` | Saves plans and A5 breakdown; prints the top operators by time |
-| `m0 logs <run-id> <engine> <query> [--grep P] [--tail N]` | Bounded log excerpts |
+| `m0 summarize [<run-id>\|latest]` | At most 40 lines: outcome counts per engine (a completed cell whose answer differs from Trino's shows as `ok_mismatch`), answer diffs per engine with the normalisations used, suite totals over common queries with ratio and geomean [95% CI], top 10 slowest relative queries, non-`ok` cells grouped by engine, outcome and error signature, every answer mismatch. Sections are capped and say what `--json` has (everything). Exit code 3 if any cell is not `ok`. See [Analysis](#analysis). |
+| `m0 compare <run-a> <run-b>` | Before/after comparison per engine, e.g. a new upstream version or `dfd-jo` vs `dfd`: totals and geomean of B/A over queries both runs completed, queries that moved beyond noise, outcome changes, changed images and config files |
+| `m0 explain <run-id> <engine> <query> [--top N] [--timeout S]` | Re-runs one query on the live engine with the run's scale factor and SQL: Trino `EXPLAIN ANALYZE` plus `/v1/query/{id}` operator summaries; `df` runs the query and reads dfrunner's plan with metrics. Saves `diag/explain.<engine>.<suite>.<id>/{query.sql, plan.txt, operators.json, stats.json}`, prints the top operators by time. Exit code 2 if the engine isn't up. |
+| `m0 logs <run-id> <engine> <query> [--grep P] [--tail N]` | `docker logs` of the engine container for each round's window of that query's cells (`started_at` to the end of the last cell, plus a few seconds). Says when the container was recreated since and the lines are gone (exit code 2 if all are). |
 | `m0 triage <run-id>` | Best-effort grouping of non-`ok` cells and harness errors by signature (outcome, engine, normalised error). Prints each group with paths to its logs, memory timeline and plan. Errors no rule recognises are grouped as `unrecognised` for the agent to look at. |
 | `m0 repro <cell-id> [--times N] [--diag]` | Re-runs one cell in isolation, optionally with extra diagnostics: `EXPLAIN ANALYZE`, verbose engine logging, 50 Hz memory sampling. Reports whether the outcome is deterministic or flaky. |
 | `m0 bisect-mem <cell-id>` | Binary-searches the memory budget to find where a query flips from `ok` to `err_mem` or `killed`. Also reports peak RSS against the pool limit at each step. |
@@ -253,9 +253,9 @@ acceptance criteria and risks per step: [implementation-plan.md](implementation-
 | Step | Harness | Skill |
 |---|---|---|
 | 1 ✅ | Repo skeleton, `m0 doctor`, local `env up/down/status`, versions lockfile | `SKILL.md` core, `preflight.md`, `environment.md` |
-| 2 | Data generation and validation (TPC-H, TPC-DS, `etl.*`) | `data.md` |
-| 3 | Trino adapter, `dfrunner` (`single` mode), cgroup sampler, classifier, smoke plan | `run.md`, first `troubleshooting.md` entries |
-| 4 | Differ, stats, `summarize`, `compare`, `explain`, `logs` | `analyse.md` |
+| 2 ✅ | Data generation and validation (TPC-H, TPC-DS, `etl.*`) | `data.md` |
+| 3 ✅ | Trino adapter, `dfrunner` (`single` mode), cgroup sampler, classifier, smoke plan | `run.md`, first `troubleshooting.md` entries |
+| 4 ✅ | Differ, stats, `summarize`, `compare`, `explain`, `logs` | `analyse.md` |
 | 4b | `triage`, `repro`, `bisect-mem`, `diff`, `sql`; `findings/TEMPLATE.md`; deliberate-failure cells in the smoke plan | `investigate.md`, `troubleshooting.md` |
 | 5 | `dfrunner` `node` mode (`dfd`), A3 setup, B2 memory levels, B3 concurrency | `run.md` and `troubleshooting.md` updates |
 | 6 | `report` | `report.md` |
@@ -268,7 +268,7 @@ m0-bench/
 ├── README.md  LICENSE  NOTICE
 ├── pyproject.toml  uv.lock          # Python deps: trino, pyyaml (matplotlib with the report)
 ├── versions.lock.yaml               # Trino image digest, DataFusion/datafusion-distributed/iceberg-rust revs, Lakekeeper, SeaweedFS, JDK
-├── m0/                              # Python package: cli, plan, queries, engines/, metrics, classify (+ classify_rules.yaml), runner, store, diff, stats, report
+├── m0/                              # Python package: cli, plan, queries, engines/, metrics, classify (+ classify_rules.yaml), runner, store, differ, stats, analysis, explain, logs, report
 ├── dfrunner/                        # Rust crate: Cargo.toml, Cargo.lock, src/
 ├── queries/
 │   ├── manifest.yaml                # id, suite, class, ordered, tie_ambiguous, rewrite reasons
@@ -445,7 +445,9 @@ The two engines measure differently (Trino operator wall time includes blocking 
 inside an operator, DataFusion `elapsed_compute` excludes async waits), so compare each
 bucket within an engine, and across engines only as a rough share.
 
-Until the differ exists, `ok` means "completed"; `ok_mismatch` comes with step 4.
+`outcome` in `cells.jsonl` is never `ok_mismatch`: the runner records `ok` for a completed
+cell, and `m0 summarize` derives `ok_mismatch` from the answer diff (see
+[Analysis](#analysis)).
 
 ### answers.jsonl
 
@@ -471,6 +473,31 @@ JSON (`m0/engines/base.py` `canonical`, dfrunner `to_json`):
 | varbinary | lowercase hex string |
 | array, row | JSON array |
 | anything else | the engine client's string form |
+
+## Analysis
+
+`m0 summarize` and `m0 compare` read `cells.jsonl` and `answers.jsonl` only
+(`m0/analysis.py`), so they work on any run, also one copied from another machine.
+
+- **Answer diffs** (`m0/differ.py`, methodology section 8): each non-Trino answer is
+  compared with Trino's answer of the same query. Columns by position; decimals at the
+  lower of the two result scales, rounded half up, one unit in the last place allowed;
+  floats with a tolerance; CHAR padding stripped; NULL equals NULL. Rows as a multiset,
+  then, for ordered queries, the sequence of `sort_keys` values (manifest), where
+  NULL placement is free. `tie_ambiguous` queries are compared on their sort-key columns
+  only. Each diff is `match` (with the normalisations it needed), `mismatch` (with the
+  first difference), `unverified` (a truncated, unordered answer) or `no_reference`.
+- **Effective outcome:** every `ok` cell of an engine x query whose diff is `mismatch`
+  counts as `ok_mismatch` in the summary and in the stats. The answer comes from the
+  first completed cell; the other iterations are assumed to return the same rows.
+- **Stats** (`m0/stats.py`, methodology section 9): per engine x query the median, min
+  and max of the `ok` hot runs (iteration 0 when a plan has no hot runs), the cold
+  time (median of iteration 0), and the CV of the hot runs. A query is completed when
+  all its cells are `ok`/`ok_mismatch`. Suite totals sum medians over the queries
+  every engine completed. Ratios are Trino / engine. The 95% confidence intervals
+  come from 1,000 bootstrap resamples of each query's runs (seed fixed in
+  `m0/stats.py`, so the same cells give the same interval).
+
 
 ## Upstream code reuse
 

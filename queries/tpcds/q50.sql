@@ -1,0 +1,40 @@
+-- TPC-DS query 50. Template query50.tpl of the
+-- TPC-DS spec v3.2.0 with its qualification substitution parameters. Trino dialect.
+-- Source: trinodb/trino@aab079cf8741:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q50.sql
+-- (Apache-2.0); its table prefix (database.schema placeholders) replaced by ${tpcds}.
+SELECT
+  "s_store_name"
+, "s_company_id"
+, "s_street_number"
+, "s_street_name"
+, "s_street_type"
+, "s_suite_number"
+, "s_city"
+, "s_county"
+, "s_state"
+, "s_zip"
+, "sum"((CASE WHEN (("sr_returned_date_sk" - "ss_sold_date_sk") <= 30) THEN 1 ELSE 0 END)) "30 days"
+, "sum"((CASE WHEN (("sr_returned_date_sk" - "ss_sold_date_sk") > 30)
+   AND (("sr_returned_date_sk" - "ss_sold_date_sk") <= 60) THEN 1 ELSE 0 END)) "31-60 days"
+, "sum"((CASE WHEN (("sr_returned_date_sk" - "ss_sold_date_sk") > 60)
+   AND (("sr_returned_date_sk" - "ss_sold_date_sk") <= 90) THEN 1 ELSE 0 END)) "61-90 days"
+, "sum"((CASE WHEN (("sr_returned_date_sk" - "ss_sold_date_sk") > 90)
+   AND (("sr_returned_date_sk" - "ss_sold_date_sk") <= 120) THEN 1 ELSE 0 END)) "91-120 days"
+, "sum"((CASE WHEN (("sr_returned_date_sk" - "ss_sold_date_sk") > 120) THEN 1 ELSE 0 END)) ">120 days"
+FROM
+  ${tpcds}.store_sales
+, ${tpcds}.store_returns
+, ${tpcds}.store
+, ${tpcds}.date_dim d1
+, ${tpcds}.date_dim d2
+WHERE ("d2"."d_year" = 2001)
+   AND ("d2"."d_moy" = 8)
+   AND ("ss_ticket_number" = "sr_ticket_number")
+   AND ("ss_item_sk" = "sr_item_sk")
+   AND ("ss_sold_date_sk" = "d1"."d_date_sk")
+   AND ("sr_returned_date_sk" = "d2"."d_date_sk")
+   AND ("ss_customer_sk" = "sr_customer_sk")
+   AND ("ss_store_sk" = "s_store_sk")
+GROUP BY "s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip"
+ORDER BY "s_store_name" ASC, "s_company_id" ASC, "s_street_number" ASC, "s_street_name" ASC, "s_street_type" ASC, "s_suite_number" ASC, "s_city" ASC, "s_county" ASC, "s_state" ASC, "s_zip" ASC
+LIMIT 100

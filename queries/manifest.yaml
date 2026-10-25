@@ -4,29 +4,280 @@
 # Fields:
 #   namespaces     placeholders the SQL uses (checked against the file)
 #   class          tpc | join | window | aggregation | deliberate
-#   ordered        the result has a total ORDER BY (compare in order; methodology 8)
-#   tie_ambiguous  LIMIT with possible ties on the sort keys (compare on sort keys only)
+#   ordered        the query ends in an ORDER BY (compare in order; methodology 8)
+#   sort_keys      ordered queries: result columns (1-based) that are ORDER BY keys, in ORDER BY
+#                  order. Keys that are expressions, not result columns, are left out. The
+#                  differ checks the order on these columns only.
+#   tie_ambiguous  LIMIT with possible ties on the sort keys at the cut (compare on sort keys
+#                  only). None is set: on Trino, row LIMIT and row LIMIT+1 of every ordered LIMIT
+#                  query differ on their sort keys at SF1 and SF10, or are identical rows.
 #   rewrite        null, or the reason this query differs from its source text
-#   source         where the text comes from
+#   source         where the text comes from: a spec section, or repo@sha:path (NOTICE)
 #   datafusion_override  (optional) reason for queries/overrides/datafusion/<suite>/<id>.sql,
 #                  used by df/dfd. Mechanical rewrites only (function name, syntax), never
 #                  a change of semantics; a query DataFusion can't express is err_unsupported.
+# Ids: q01..q22 (TPC-H), q01..q99 (TPC-DS); the two-part TPC-DS queries 14, 23, 24 and 39 are
+# q14a/q14b, q23a/q23b, q24a/q24b, q39a/q39b, as in trinodb/trino's benchmark queries.
 queries:
-  - {suite: tpch, id: q01, class: tpc, namespaces: [tpch], ordered: true, tie_ambiguous: false, rewrite: null,
+  - {suite: tpch, id: q01, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
      source: "TPC-H v3.0.1 2.4.1, validation parameters"}
-  - {suite: tpch, id: q03, class: tpc, namespaces: [tpch], ordered: true, tie_ambiguous: false, rewrite: null,
+  - {suite: tpch, id: q02, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1, 3, 2, 4], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q2.sql"}
+  - {suite: tpch, id: q03, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2, 3], tie_ambiguous: false, rewrite: null,
      source: "TPC-H v3.0.1 2.4.3, validation parameters"}
+  - {suite: tpch, id: q04, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: 'string literal compared with o_orderdate written as a DATE literal (Trino has no implicit varchar-to-date cast)',
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q4.sql"}
+  - {suite: tpch, id: q05, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q5.sql"}
   - {suite: tpch, id: q06, class: tpc, namespaces: [tpch], ordered: false, tie_ambiguous: false, rewrite: null,
      source: "TPC-H v3.0.1 2.4.6, validation parameters"}
-  - {suite: tpcds, id: q03, class: tpc, namespaces: [tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+  - {suite: tpch, id: q07, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q7.sql"}
+  - {suite: tpch, id: q08, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q8.sql"}
+  - {suite: tpch, id: q09, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q9.sql"}
+  - {suite: tpch, id: q10, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [3], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q10.sql"}
+  - {suite: tpch, id: q11, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: 'FRACTION fixed at the SF1 value 0.0001 at every scale factor (spec: 0.0001 / SF)',
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q11.sql"}
+  - {suite: tpch, id: q12, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q12.sql"}
+  - {suite: tpch, id: q13, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2, 1], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q13.sql"}
+  - {suite: tpch, id: q14, class: tpc, namespaces: [tpch], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q14.sql"}
+  - {suite: tpch, id: q15, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: 'the CREATE VIEW revenue0 / SELECT / DROP VIEW triple is one WITH query with the same view text',
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q15.sql"}
+  - {suite: tpch, id: q16, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [4, 1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q16.sql"}
+  - {suite: tpch, id: q17, class: tpc, namespaces: [tpch], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q17.sql"}
+  - {suite: tpch, id: q18, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [5, 4], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q18.sql"}
+  - {suite: tpch, id: q19, class: tpc, namespaces: [tpch], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q19.sql"}
+  - {suite: tpch, id: q20, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q20.sql"}
+  - {suite: tpch, id: q21, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2, 1], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q21.sql"}
+  - {suite: tpch, id: q22, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q22.sql"}
+  - {suite: tpcds, id: q01, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q01.sql"}
+  - {suite: tpcds, id: q02, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q02.sql"}
+  - {suite: tpcds, id: q03, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 4, 2], tie_ambiguous: false, rewrite: null,
      source: "TPC-DS v3.2.0 query3.tpl, qualification parameters"}
-  - {suite: tpcds, id: q07, class: tpc, namespaces: [tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+  - {suite: tpcds, id: q04, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q04.sql"}
+  - {suite: tpcds, id: q05, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q05.sql"}
+  - {suite: tpcds, id: q06, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [2, 1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q06.sql"}
+  - {suite: tpcds, id: q07, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
      source: "TPC-DS v3.2.0 query7.tpl, qualification parameters"}
-  - {suite: tpcds, id: q55, class: tpc, namespaces: [tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+  - {suite: tpcds, id: q08, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q08.sql"}
+  - {suite: tpcds, id: q09, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q09.sql"}
+  - {suite: tpcds, id: q10, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 5, 7, 9, 11, 13], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q10.sql"}
+  - {suite: tpcds, id: q11, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q11.sql"}
+  - {suite: tpcds, id: q12, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3, 4, 1, 2, 7], tie_ambiguous: false, rewrite: 'one column alias carries the source''s database.schema placeholders (an upstream slip); it is the plain name, as in the spec',
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q12.sql"}
+  - {suite: tpcds, id: q13, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q13.sql"}
+  - {suite: tpcds, id: q14a, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q14a.sql"}
+  - {suite: tpcds, id: q14b, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q14b.sql"}
+  - {suite: tpcds, id: q15, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q15.sql"}
+  - {suite: tpcds, id: q16, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q16.sql"}
+  - {suite: tpcds, id: q17, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q17.sql"}
+  - {suite: tpcds, id: q18, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [2, 3, 4, 1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q18.sql"}
+  - {suite: tpcds, id: q19, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [5, 2, 1, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q19.sql"}
+  - {suite: tpcds, id: q20, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3, 4, 1, 2, 7], tie_ambiguous: false, rewrite: 'one column alias carries the source''s database.schema placeholders (an upstream slip); it is the plain name, as in the spec',
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q20.sql"}
+  - {suite: tpcds, id: q21, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q21.sql"}
+  - {suite: tpcds, id: q22, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [5, 1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q22.sql"}
+  - {suite: tpcds, id: q23a, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q23a.sql"}
+  - {suite: tpcds, id: q23b, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q23b.sql"}
+  - {suite: tpcds, id: q24a, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q24a.sql"}
+  - {suite: tpcds, id: q24b, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q24b.sql"}
+  - {suite: tpcds, id: q25, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q25.sql"}
+  - {suite: tpcds, id: q26, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q26.sql"}
+  - {suite: tpcds, id: q27, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q27.sql"}
+  - {suite: tpcds, id: q28, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q28.sql"}
+  - {suite: tpcds, id: q29, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q29.sql"}
+  - {suite: tpcds, id: q30, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q30.sql"}
+  - {suite: tpcds, id: q31, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q31.sql"}
+  - {suite: tpcds, id: q32, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q32.sql"}
+  - {suite: tpcds, id: q33, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q33.sql"}
+  - {suite: tpcds, id: q34, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q34.sql"}
+  - {suite: tpcds, id: q35, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 9, 14], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q35.sql"}
+  - {suite: tpcds, id: q36, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [4, 5, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q36.sql"}
+  - {suite: tpcds, id: q37, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q37.sql"}
+  - {suite: tpcds, id: q38, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q38.sql"}
+  - {suite: tpcds, id: q39a, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 8, 9, 10], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q39a.sql",
+     datafusion_override: 'the two CAST(inv.cov AS DECIMAL(30, 10)) columns get aliases; DataFusion names them inv1.cov, which clashes with the column its ORDER BY adds (Projections require unique expression names)'}
+  - {suite: tpcds, id: q39b, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 8, 9, 10], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q39b.sql",
+     datafusion_override: 'the two CAST(inv.cov AS DECIMAL(30, 10)) columns get aliases; DataFusion names them inv1.cov, which clashes with the column its ORDER BY adds (Projections require unique expression names)'}
+  - {suite: tpcds, id: q40, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q40.sql"}
+  - {suite: tpcds, id: q41, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q41.sql"}
+  - {suite: tpcds, id: q42, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [4, 1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q42.sql"}
+  - {suite: tpcds, id: q43, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q43.sql"}
+  - {suite: tpcds, id: q44, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q44.sql"}
+  - {suite: tpcds, id: q45, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q45.sql"}
+  - {suite: tpcds, id: q46, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q46.sql"}
+  - {suite: tpcds, id: q47, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q47.sql"}
+  - {suite: tpcds, id: q48, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q48.sql"}
+  - {suite: tpcds, id: q49, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 4, 5, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q49.sql",
+     datafusion_override: 'quoted identifiers are case-sensitive in DataFusion and folded to lower case by Trino; the upper-case quoted alias "CATALOG" is written "catalog" (Schema error: No field named ...)'}
+  - {suite: tpcds, id: q50, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q50.sql"}
+  - {suite: tpcds, id: q51, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q51.sql"}
+  - {suite: tpcds, id: q52, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 4, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q52.sql"}
+  - {suite: tpcds, id: q53, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3, 2, 1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q53.sql"}
+  - {suite: tpcds, id: q54, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q54.sql"}
+  - {suite: tpcds, id: q55, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3, 1], tie_ambiguous: false, rewrite: null,
      source: "TPC-DS v3.2.0 query55.tpl, qualification parameters"}
+  - {suite: tpcds, id: q56, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [2, 1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q56.sql"}
+  - {suite: tpcds, id: q57, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q57.sql"}
+  - {suite: tpcds, id: q58, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q58.sql"}
+  - {suite: tpcds, id: q59, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q59.sql"}
+  - {suite: tpcds, id: q60, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q60.sql"}
+  - {suite: tpcds, id: q61, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q61.sql"}
+  - {suite: tpcds, id: q62, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q62.sql"}
+  - {suite: tpcds, id: q63, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 3, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q63.sql"}
+  - {suite: tpcds, id: q64, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 21, 14, 15, 16, 17, 18], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q64.sql"}
+  - {suite: tpcds, id: q65, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 6, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q65.sql"}
+  - {suite: tpcds, id: q66, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q66.sql",
+     datafusion_override: 'quoted identifiers are case-sensitive in DataFusion and folded to lower case by Trino; the upper-case quoted alias "YEAR" is written "year" (Schema error: No field named ...)'}
+  - {suite: tpcds, id: q67, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q67.sql"}
+  - {suite: tpcds, id: q68, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q68.sql"}
+  - {suite: tpcds, id: q69, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 5, 7], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q69.sql"}
+  - {suite: tpcds, id: q70, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [4, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q70.sql"}
+  - {suite: tpcds, id: q71, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [5, 1, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q71.sql"}
+  - {suite: tpcds, id: q72, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [6, 1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q72.sql"}
+  - {suite: tpcds, id: q73, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [6, 1, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q73.sql"}
+  - {suite: tpcds, id: q74, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q74.sql",
+     datafusion_override: 'quoted identifiers are case-sensitive in DataFusion and folded to lower case by Trino; the upper-case quoted alias "YEAR" is written "year" (Schema error: No field named ...)'}
+  - {suite: tpcds, id: q75, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [9, 10], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q75.sql"}
+  - {suite: tpcds, id: q76, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q76.sql"}
+  - {suite: tpcds, id: q77, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q77.sql"}
+  - {suite: tpcds, id: q78, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 5, 6, 7, 8, 9, 10, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q78.sql"}
+  - {suite: tpcds, id: q79, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 6], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q79.sql"}
+  - {suite: tpcds, id: q80, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q80.sql"}
+  - {suite: tpcds, id: q81, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q81.sql"}
+  - {suite: tpcds, id: q82, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q82.sql"}
+  - {suite: tpcds, id: q83, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q83.sql"}
+  - {suite: tpcds, id: q84, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: 'one column alias carries the source''s database.schema placeholders (an upstream slip); it is the plain name, as in the spec',
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q84.sql",
+     datafusion_override: 'Trino concat() is NULL if an argument is NULL, DataFusion concat() skips NULLs; DataFusion || has Trino concat() semantics, so concat(concat(a, '', ''), b) is written ((a || '', '') || b)'}
+  - {suite: tpcds, id: q85, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3, 4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q85.sql"}
+  - {suite: tpcds, id: q86, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [4, 5], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q86.sql"}
+  - {suite: tpcds, id: q87, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q87.sql"}
+  - {suite: tpcds, id: q88, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q88.sql"}
+  - {suite: tpcds, id: q89, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q89.sql"}
+  - {suite: tpcds, id: q90, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q90.sql"}
+  - {suite: tpcds, id: q91, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [4], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q91.sql"}
+  - {suite: tpcds, id: q92, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q92.sql"}
+  - {suite: tpcds, id: q93, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [2, 1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q93.sql"}
+  - {suite: tpcds, id: q94, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q94.sql"}
+  - {suite: tpcds, id: q95, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q95.sql"}
+  - {suite: tpcds, id: q96, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q96.sql"}
+  - {suite: tpcds, id: q97, class: tpc, namespaces: [tpcds], ordered: false, tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q97.sql"}
+  - {suite: tpcds, id: q98, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [3, 4, 1, 2, 7], tie_ambiguous: false, rewrite: 'one column alias carries the source''s database.schema placeholders (an upstream slip); it is the plain name, as in the spec',
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q98.sql"}
+  - {suite: tpcds, id: q99, class: tpc, namespaces: [tpcds], ordered: true, sort_keys: [1, 2, 3], tie_ambiguous: false, rewrite: null,
+     source: "trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q99.sql"}
   - {suite: etl, id: W1, class: window, namespaces: [etl], ordered: false, tie_ambiguous: false, rewrite: null,
      source: "this benchmark, B1 W1"}
-  - {suite: etl, id: J3, class: join, namespaces: [etl, tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
+  - {suite: etl, id: J3, class: join, namespaces: [etl, tpcds], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
      source: "this benchmark, B1 J3"}
   - {suite: etl, id: X1_mem, class: deliberate, namespaces: [etl], ordered: false, tie_ambiguous: false, rewrite: null,
      source: "this benchmark, deliberate out-of-memory cell for smoke plans",

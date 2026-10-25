@@ -12,6 +12,13 @@ Adapted files:
   Derived from datafusion-contrib/datafusion-distributed@ee3eacd93af66e4ef2e2e72a253842c723f92ca5:benchmarks/remote-worker/src/main.rs
   (HTTP query endpoint, shared SessionContext with the Iceberg integration,
   abort-on-drop query task, mimalloc allocator)
+- queries/tpcds/*.sql (all but q03, q07, q55) and queries/overrides/datafusion/tpcds/*.sql
+  Derived from trinodb/trino@aab079cf8741f88001ecfeb0e46ce0841eac5f29:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/<id>.sql
+  (TPC-DS query text in Trino's dialect; table prefix and a few column aliases changed,
+  as each file's header says)
+- queries/tpch/q02.sql, q04.sql, q05.sql, q07.sql to q22.sql
+  Derived from apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q<N>.sql
+  (TPC-H query text; table names prefixed, q04 date literal, q15 view as a WITH query)
 
 Libraries used by dfrunner (dependencies, not copied code): Apache DataFusion,
 datafusion-distributed and datafusion-distributed-iceberg, Apache Iceberg Rust

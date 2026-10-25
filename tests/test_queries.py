@@ -70,3 +70,27 @@ def test_real_manifest_overrides_have_reasons():
         if q.datafusion_override:
             assert len(q.datafusion_override) > 20, q.key
             assert q.override_path("datafusion").is_file()
+
+
+def test_sort_keys_need_ordered_and_tie_ambiguous_needs_sort_keys(qdir):
+    path = qdir / "manifest.yaml"
+    path.write_text(ENTRY.replace("ordered: false", "ordered: false, sort_keys: [1]") % "")
+    with pytest.raises(queries.QueryError, match="sort_keys need ordered"):
+        queries.load_manifest(path)
+    path.write_text(ENTRY.replace("ordered: false", "ordered: true").replace("tie_ambiguous: false",
+                                                                             "tie_ambiguous: true") % "")
+    with pytest.raises(queries.QueryError, match="tie_ambiguous needs sort_keys"):
+        queries.load_manifest(path)
+    path.write_text(ENTRY.replace("ordered: false", "ordered: true, sort_keys: [2, 1]") % "")
+    assert queries.load_manifest(path)["tpch/q99"].sort_keys == (2, 1)
+
+
+def test_real_manifest_is_the_full_catalogue():
+    m = queries.load_manifest()
+    assert sum(q.suite == "tpch" for q in m.values()) == 22
+    tpcds = {q.id for q in m.values() if q.suite == "tpcds"}
+    assert len(tpcds) == 103 and {"q14a", "q14b", "q23a", "q23b", "q24a", "q24b", "q39a", "q39b"} <= tpcds
+    for q in m.values():
+        assert not q.ordered or q.sort_keys, f"{q.key}: ordered without sort_keys"
+        if q.suite != "etl":
+            assert "@" in q.source or q.source.startswith("TPC-"), q.key

@@ -222,14 +222,19 @@ class TrinoEngine(Engine):
         except (OSError, urllib.error.HTTPError):
             pass
 
-    def stats(self, engine_query_id: str) -> dict | None:
+    def query_info(self, engine_query_id: str) -> dict | None:
+        """Full `/v1/query/{id}` (~250 KB), once the query has finished or failed."""
         # The final info appears shortly after the client sees the end of the result.
         for _ in range(20):
             status, info = self._get(f"/v1/query/{engine_query_id}", timeout=30)
             if status == 200 and info and info.get("state") in ("FINISHED", "FAILED"):
-                return trim_query_info(info)
+                return info
             time.sleep(0.25)
-        return trim_query_info(info) if status == 200 and info else None
+        return info if status == 200 and info else None
+
+    def stats(self, engine_query_id: str) -> dict | None:
+        info = self.query_info(engine_query_id)
+        return trim_query_info(info) if info else None
 
     def metrics(self, stats: dict | None) -> dict:
         qs = (stats or {}).get("queryStats") or {}

@@ -1,0 +1,148 @@
+-- TPC-DS query 5. Template query5.tpl of the
+-- TPC-DS spec v3.2.0 with its qualification substitution parameters. Trino dialect.
+-- Source: trinodb/trino@aab079cf8741:testing/trino-benchmark-queries/src/main/resources/sql/trino/tpcds/q05.sql
+-- (Apache-2.0); its table prefix (database.schema placeholders) replaced by ${tpcds}.
+WITH
+  ssr AS (
+   SELECT
+     "s_store_id"
+   , "sum"("sales_price") "sales"
+   , "sum"("profit") "profit"
+   , "sum"("return_amt") "returns"
+   , "sum"("net_loss") "profit_loss"
+   FROM
+     (
+      SELECT
+        "ss_store_sk" "store_sk"
+      , "ss_sold_date_sk" "date_sk"
+      , "ss_ext_sales_price" "sales_price"
+      , "ss_net_profit" "profit"
+      , CAST(0 AS DECIMAL(7,2)) "return_amt"
+      , CAST(0 AS DECIMAL(7,2)) "net_loss"
+      FROM
+        ${tpcds}.store_sales
+UNION ALL       SELECT
+        "sr_store_sk" "store_sk"
+      , "sr_returned_date_sk" "date_sk"
+      , CAST(0 AS DECIMAL(7,2)) "sales_price"
+      , CAST(0 AS DECIMAL(7,2)) "profit"
+      , "sr_return_amt" "return_amt"
+      , "sr_net_loss" "net_loss"
+      FROM
+        ${tpcds}.store_returns
+   )  salesreturns
+   , ${tpcds}.date_dim
+   , ${tpcds}.store
+   WHERE ("date_sk" = "d_date_sk")
+      AND ("d_date" BETWEEN CAST('2000-08-23' AS DATE) AND (CAST('2000-08-23' AS DATE) + INTERVAL  '14' DAY))
+      AND ("store_sk" = "s_store_sk")
+   GROUP BY "s_store_id"
+)
+, csr AS (
+   SELECT
+     "cp_catalog_page_id"
+   , "sum"("sales_price") "sales"
+   , "sum"("profit") "profit"
+   , "sum"("return_amt") "returns"
+   , "sum"("net_loss") "profit_loss"
+   FROM
+     (
+      SELECT
+        "cs_catalog_page_sk" "page_sk"
+      , "cs_sold_date_sk" "date_sk"
+      , "cs_ext_sales_price" "sales_price"
+      , "cs_net_profit" "profit"
+      , CAST(0 AS DECIMAL(7,2)) "return_amt"
+      , CAST(0 AS DECIMAL(7,2)) "net_loss"
+      FROM
+        ${tpcds}.catalog_sales
+UNION ALL       SELECT
+        "cr_catalog_page_sk" "page_sk"
+      , "cr_returned_date_sk" "date_sk"
+      , CAST(0 AS DECIMAL(7,2)) "sales_price"
+      , CAST(0 AS DECIMAL(7,2)) "profit"
+      , "cr_return_amount" "return_amt"
+      , "cr_net_loss" "net_loss"
+      FROM
+        ${tpcds}.catalog_returns
+   )  salesreturns
+   , ${tpcds}.date_dim
+   , ${tpcds}.catalog_page
+   WHERE ("date_sk" = "d_date_sk")
+      AND ("d_date" BETWEEN CAST('2000-08-23' AS DATE) AND (CAST('2000-08-23' AS DATE) + INTERVAL  '14' DAY))
+      AND ("page_sk" = "cp_catalog_page_sk")
+   GROUP BY "cp_catalog_page_id"
+)
+, wsr AS (
+   SELECT
+     "web_site_id"
+   , "sum"("sales_price") "sales"
+   , "sum"("profit") "profit"
+   , "sum"("return_amt") "returns"
+   , "sum"("net_loss") "profit_loss"
+   FROM
+     (
+      SELECT
+        "ws_web_site_sk" "wsr_web_site_sk"
+      , "ws_sold_date_sk" "date_sk"
+      , "ws_ext_sales_price" "sales_price"
+      , "ws_net_profit" "profit"
+      , CAST(0 AS DECIMAL(7,2)) "return_amt"
+      , CAST(0 AS DECIMAL(7,2)) "net_loss"
+      FROM
+        ${tpcds}.web_sales
+UNION ALL       SELECT
+        "ws_web_site_sk" "wsr_web_site_sk"
+      , "wr_returned_date_sk" "date_sk"
+      , CAST(0 AS DECIMAL(7,2)) "sales_price"
+      , CAST(0 AS DECIMAL(7,2)) "profit"
+      , "wr_return_amt" "return_amt"
+      , "wr_net_loss" "net_loss"
+      FROM
+        (${tpcds}.web_returns
+      LEFT JOIN ${tpcds}.web_sales ON ("wr_item_sk" = "ws_item_sk")
+         AND ("wr_order_number" = "ws_order_number"))
+   )  salesreturns
+   , ${tpcds}.date_dim
+   , ${tpcds}.web_site
+   WHERE ("date_sk" = "d_date_sk")
+      AND ("d_date" BETWEEN CAST('2000-08-23' AS DATE) AND (CAST('2000-08-23' AS DATE) + INTERVAL  '14' DAY))
+      AND ("wsr_web_site_sk" = "web_site_sk")
+   GROUP BY "web_site_id"
+)
+SELECT
+  "channel"
+, "id"
+, "sum"("sales") "sales"
+, "sum"("returns") "returns"
+, "sum"("profit") "profit"
+FROM
+  (
+   SELECT
+     'store channel' "channel"
+   , "concat"('store', "s_store_id") "id"
+   , "sales"
+   , "returns"
+   , ("profit" - "profit_loss") "profit"
+   FROM
+     ssr
+UNION ALL    SELECT
+     'catalog channel' "channel"
+   , "concat"('catalog_page', "cp_catalog_page_id") "id"
+   , "sales"
+   , "returns"
+   , ("profit" - "profit_loss") "profit"
+   FROM
+     csr
+UNION ALL    SELECT
+     'web channel' "channel"
+   , "concat"('web_site', "web_site_id") "id"
+   , "sales"
+   , "returns"
+   , ("profit" - "profit_loss") "profit"
+   FROM
+     wsr
+)  x
+GROUP BY ROLLUP (channel, id)
+ORDER BY "channel" ASC, "id" ASC
+LIMIT 100

@@ -267,20 +267,29 @@ def planned_cells(run: dict) -> int:
     return len(plan_mod.expand(run["plan"])) if run.get("plan") else 0
 
 
-def cmd_status(args: argparse.Namespace) -> Exit:
-    from m0 import runner, store
+def find_run(run_id: str | None):
+    """RunStore for a run ID or `latest`; None if there is no such run."""
+    from m0 import store
 
-    runs = store.list_runs()
-    if args.run in (None, "latest"):
-        if not runs:
-            print_checks([Check("status", FAIL, "no runs under results/")], args.json)
-            return Exit.PREREQUISITE
-        s = runs[-1]
-    else:
-        s = store.RunStore(args.run)
-        if not s.exists():
-            print_checks([Check("status", FAIL, f"no run {args.run!r} under results/")], args.json)
-            return Exit.PREREQUISITE
+    if run_id in (None, "latest"):
+        runs = store.list_runs()
+        return runs[-1] if runs else None
+    s = store.RunStore(run_id)
+    return s if s.exists() else None
+
+
+def no_run(command: str, run_id: str | None, as_json: bool) -> Exit:
+    what = "no runs under results/" if run_id in (None, "latest") else f"no run {run_id!r} under results/"
+    print_checks([Check(command, FAIL, what)], as_json)
+    return Exit.PREREQUISITE
+
+
+def cmd_status(args: argparse.Namespace) -> Exit:
+    from m0 import runner
+
+    s = find_run(args.run)
+    if s is None:
+        return no_run("status", args.run, args.json)
     rows, run = s.rows(), s.read_run()
     planned = planned_cells(run)
     state = run_state(s, rows, planned)
@@ -350,6 +359,78 @@ def cmd_results(args: argparse.Namespace) -> Exit:
     return Exit.OK
 
 
+def cmd_summarize(args: argparse.Namespace) -> Exit:
+    from m0 import analysis
+
+    s = find_run(args.run)
+    if s is None:
+        return no_run("summarize", args.run, args.json)
+    summary = analysis.summarize(s)
+    if args.json:
+        print(json.dumps(summary, indent=1, default=str))
+    else:
+        print("\n".join(analysis.render_summary(summary)))
+    bad = any(o != "ok" for counts in summary["counts"].values() for o in counts)
+    return Exit.QUERIES_FAILED if bad else Exit.OK
+
+
+def cmd_compare(args: argparse.Namespace) -> Exit:
+    from m0 import analysis
+
+    a, b = find_run(args.run_a), find_run(args.run_b)
+    if a is None or b is None:
+        return no_run("compare", args.run_a if a is None else args.run_b, args.json)
+    c = analysis.compare(a, b)
+    if args.json:
+        print(json.dumps(c, indent=1, default=str))
+    else:
+        print("\n".join(analysis.render_compare(c)))
+    return Exit.OK
+
+
+def cmd_explain(args: argparse.Namespace) -> Exit:
+    from m0 import explain
+
+    s = find_run(args.run)
+    if s is None:
+        return no_run("explain", args.run, args.json)
+    try:
+        q = explain.find_query(args.query)
+        r = explain.explain(s, args.engine, q, args.timeout)
+    except (explain.ExplainError, env_local.EnvError) as e:
+        print_checks([Check("explain", FAIL, str(e))], args.json)
+        return Exit.PREREQUISITE
+    if args.json:
+        print(json.dumps(r, indent=1, default=str))
+    else:
+        print("\n".join(explain.render(r, args.top)))
+    return Exit.QUERIES_FAILED if r["error"] else Exit.OK
+
+
+def cmd_logs(args: argparse.Namespace) -> Exit:
+    from m0 import engines, explain, logs
+
+    s = find_run(args.run)
+    if s is None:
+        return no_run("logs", args.run, args.json)
+    try:
+        q = explain.find_query(args.query)
+    except explain.ExplainError as e:
+        print_checks([Check("logs", FAIL, str(e))], args.json)
+        return Exit.PREREQUISITE
+    service = engines.get(args.engine).service if args.engine in engines.available() else args.engine
+    r = logs.collect(s.rows(), args.engine, service, q, args.grep, args.tail)
+    if not r["windows"]:
+        print_checks([Check("logs", FAIL, f"run {s.run_id} has no {args.engine} cells of {q.key}")], args.json)
+        return Exit.PREREQUISITE
+    if args.json:
+        print(json.dumps(r, indent=1, default=str))
+    else:
+        print("\n".join(logs.render(r)))
+    gone = all(w["status"].startswith("gone") for w in r["windows"])
+    return Exit.PREREQUISITE if gone else Exit.OK
+
+
 def engines_available() -> tuple[str, ...]:
     from m0 import engines
 
@@ -397,6 +478,33 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", parents=[common], help="progress and last failure of a run")
     p.add_argument("run", nargs="?", default="latest", help="run ID or latest (default)")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("summarize", parents=[common],
+                       help="outcomes, answer diffs, suite totals and ratios, slowest queries, failures of a run")
+    p.add_argument("run", nargs="?", default="latest", help="run ID or latest (default)")
+    p.set_defaults(func=cmd_summarize)
+
+    p = sub.add_parser("compare", parents=[common], help="run B against run A per engine and query (B/A times)")
+    p.add_argument("run_a", help="run ID (before), or latest")
+    p.add_argument("run_b", help="run ID (after), or latest")
+    p.set_defaults(func=cmd_compare)
+
+    p = sub.add_parser("explain", parents=[common],
+                       help="re-run one query on the live engine; save its plan with metrics under diag/")
+    p.add_argument("run", help="run ID or latest (scale factor and SQL come from the run)")
+    p.add_argument("engine", choices=engines_available())
+    p.add_argument("query", help="suite/id, or an id only one suite has")
+    p.add_argument("--top", type=int, default=10, help="operators to print (default 10)")
+    p.add_argument("--timeout", type=float, help="seconds (default: the plan's timeout_s)")
+    p.set_defaults(func=cmd_explain)
+
+    p = sub.add_parser("logs", parents=[common], help="engine container log lines during one query's cells")
+    p.add_argument("run", help="run ID or latest")
+    p.add_argument("engine", choices=engines_available())
+    p.add_argument("query", help="suite/id, or an id only one suite has")
+    p.add_argument("--grep", help="only lines matching this regular expression (case-insensitive)")
+    p.add_argument("--tail", type=int, default=40, help="last N matching lines (default 40)")
+    p.set_defaults(func=cmd_logs)
 
     p = sub.add_parser("results", parents=[common], help="list runs under results/, prune runs not kept")
     p.add_argument("action", choices=["list", "prune"])
