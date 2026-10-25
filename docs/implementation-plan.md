@@ -34,7 +34,7 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 3c | Simplify result storage (JSON only, fewer artifacts) | S | next |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | |
 | 4b | Investigation helpers and deliberate failures | S | |
-| 5 | Distributed `dfd`, memory levels, concurrency, B1 queries | L | |
+| 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
 | L | Phase L execution and Gate L | M | |
 | 7 | Phase C (AWS) | L | after Gate L |
@@ -445,9 +445,34 @@ failure.
 
 ## Step 5: distributed execution and pressure suites
 
-**Goal.** Cover everything else Phase L needs.
+**Goal.** Cover everything else Phase L needs, and put an environment interface
+between the runner and where engines run, so the AWS phase is a second
+implementation of that interface rather than a rewrite. Added at the user's request
+on 2026-10-25.
 
 **Scope:**
+- **Environment interface** (`m0/environments/`), mirroring the engine adapters.
+  Today the runner calls `env_local` directly, and `metrics.py` assumes engine
+  containers are on the local machine.
+  - **Operations:**
+    - start, stop and restart an engine on its N nodes, cold;
+    - drop page caches on every engine node;
+    - per-node CPU and memory samples, plus OOM and exit signals, for the
+      classifier;
+    - catalog and storage settings for the engines;
+    - where results are written.
+  - **`local` implementation:** the existing Compose stack, with multi-node engines
+    as several containers (`dfd` workers, Trino coordinator plus worker) and per-node
+    cgroup sampling.
+  - **`aws` stub:** defines the same operations and raises "not implemented" until
+    step 7. Step 7 fills it in: per-node metrics are collected on each node and sent
+    back to the harness on the coordinator, and results are synced to S3.
+  - **The runner, `doctor` and `data` commands use only the interface.** Plans name
+    their environment (`env: local`).
+  - **Results:** `run.json` (step 3c) records the environment and node layout.
+    `cells.jsonl` records per-node peaks and the maximum across nodes.
+  - **Acceptance:** the smoke plan runs unchanged through the interface. Engine and
+    runner tests use a fake environment (no Docker needed).
 - **`dfrunner` node mode (`dfd`):**
   - N workers plus coordinator over Arrow Flight;
   - static worker resolver from compose service names;
@@ -509,6 +534,7 @@ section either has content or says why it's empty.
 Starts only after Gate L.
 
 **Scope:**
+- The `aws` implementation of the environment interface from step 5.
 - `infra/aws/*.sh` and `m0 aws status|cost|ttl|teardown`:
   - tag-based;
   - instance TTL;
