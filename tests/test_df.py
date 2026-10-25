@@ -1,14 +1,10 @@
-"""DataFusion adapter: error mapping, byte sizes, comparable result types."""
+"""DataFusion adapter: error mapping, byte sizes, metrics, JSON results comparable with Trino's."""
 
 import datetime as dt
 from decimal import Decimal
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from m0.engines.base import ExecResult
-from m0.engines.df import DfEngine, engine_error, parse_bytes
-from m0.store import RunStore, comparable_type, normalize_table
+from m0.engines.base import ExecResult, canonical
+from m0.engines.df import DfEngine, engine_error, operator_time, parse_bytes
 
 
 def test_engine_error_from_structured_body():
@@ -53,56 +49,88 @@ def test_config_files_exist():
 
 
 def test_metrics_from_stats():
-    stats = {"elapsed_ms": 12.5, "process_cpu_s": 0.7, "pool": {"peak": 1234, "limit": 4}}
+    stats = {"elapsed_ms": 12.5, "planning_ms": 2.0, "process_cpu_s": 0.7, "pool": {"peak": 1234, "limit": 4},
+             "metrics": {"operators": [
+                 {"depth": 0, "op": "SortPreservingMergeExec", "metrics": {"elapsed_compute": 1_000_000}},
+                 {"depth": 1, "op": "AggregateExec", "metrics": {"elapsed_compute": 5_000_000}},
+                 {"depth": 2, "op": "RepartitionExec", "metrics": {"elapsed_compute": 10, "repartition_time": 2_000_000,
+                                                                   "send_time": 1_000_000, "fetch_time": 9e9}},
+                 {"depth": 3, "op": "DataSourceExec", "metrics": {"elapsed_compute": 7}}]}}
     assert DfEngine().metrics(stats) == {"engine_elapsed_ms": 12.5, "engine_cpu_s": 0.7,
-                                         "engine_peak_mem_bytes": 1234}
-    assert DfEngine().metrics(None)["engine_peak_mem_bytes"] is None
+                                         "engine_peak_mem_bytes": 1234, "planning_ms": 2.0,
+                                         "scan_ms": None, "exchange_ms": 4.0, "compute_ms": 5.0}
+    none = DfEngine().metrics(None)
+    assert none["engine_peak_mem_bytes"] is None and none["compute_ms"] is None
 
 
-def test_comparable_types():
-    assert comparable_type(pa.string_view()) == pa.string()
-    assert comparable_type(pa.large_string()) == pa.string()
-    assert comparable_type(pa.binary_view()) == pa.binary()
-    assert comparable_type(pa.dictionary(pa.int32(), pa.large_string())) == pa.string()
-    assert comparable_type(pa.large_list(pa.string_view())) == pa.list_(pa.string())
-    for keep in (pa.int64(), pa.decimal128(38, 2), pa.date32(), pa.timestamp("us"), pa.float64()):
-        assert comparable_type(keep) == keep
+def test_scan_time_only_from_a_scan_timer():
+    ops = [{"op": "DataSourceExec", "metrics": {"elapsed_compute": 5, "time_elapsed_processing": 3_000_000}}]
+    assert operator_time(ops)["scan_ms"] == 3.0
+    assert operator_time([])["scan_ms"] is None
 
 
-def test_normalize_table_keeps_values_and_engine_types():
-    t = pa.table({"name": pa.array(["a", None], type=pa.string_view()),
-                  "n": pa.array([1, 2], type=pa.int64())})
-    out = normalize_table(t, [("name", "Utf8View"), ("n", "Int64")])
-    assert out.schema.types == [pa.string(), pa.int64()]
-    assert out.column("name").to_pylist() == ["a", None]
-    assert out.schema.metadata[b"engine_types"] == b'["Utf8View", "Int64"]'
+def test_canonical_json_values():
+    assert canonical(Decimal("1.50")) == "1.50"
+    assert canonical(Decimal("-0.00")) == "0.00"
+    assert canonical(Decimal("1E+2")) == "100"
+    assert canonical(dt.date(2000, 1, 2)) == "2000-01-02"
+    assert canonical(dt.datetime(2000, 1, 2, 3, 4, 5, 6000)) == "2000-01-02T03:04:05.006000"
+    tz = dt.timezone(dt.timedelta(hours=2))
+    assert canonical(dt.datetime(2000, 1, 2, 3, 4, 5, tzinfo=tz)) == "2000-01-02T01:04:05.000000Z"
+    assert canonical(float("nan")) == "NaN" and canonical(float("-inf")) == "-Infinity"
+    assert canonical(b"\x0a\xff") == "0aff"
+    assert canonical([1, Decimal("2.0"), None]) == [1, "2.0", None]
+    assert [canonical(v) for v in (None, True, 3, 0.25, "x")] == [None, True, 3, 0.25, "x"]
 
 
-def test_arrow_and_trino_results_store_the_same_types(tmp_path):
-    store = RunStore("r", root=tmp_path)
-    (tmp_path / "r").mkdir()
-    trino_cols = [("c", "varchar"), ("s", "decimal(17,2)"), ("d", "date"), ("n", "bigint")]
-    rows = [["x", Decimal("1.50"), dt.date(2000, 1, 2), 3]]
-    df = pa.table({"c": pa.array(["x"], pa.string_view()), "s": pa.array([Decimal("1.50")], pa.decimal128(17, 2)),
-                   "d": pa.array([dt.date(2000, 1, 2)], pa.date32()), "n": pa.array([3], pa.int64())})
-    assert store.write_result("trino.c", trino_cols, rows, 10) == "full"
-    assert store.write_result("df.c", [(f.name, str(f.type)) for f in df.schema], None, 10, table=df) == "full"
-    a = pq.read_table(tmp_path / "r" / "rows" / "trino.c.parquet")
-    b = pq.read_table(tmp_path / "r" / "rows" / "df.c.parquet")
-    assert a.schema.types == b.schema.types
-    assert a.to_pylist() == b.to_pylist()
+# The same SELECT on both engines, recorded 2026-10-25 on the local stack (tpch_sf1.lineitem,
+# first two rows): bigint, decimal(12,2), date, CAST(date AS timestamp), CAST(.. AS real),
+# CAST(.. AS double), varchar, boolean, NULL varchar, decimal(12,2), decimal(38,4).
+# DF_BODY is dfrunner's response (dfrunner/src/query.rs `to_json`); TRINO_ROWS are the
+# trino client's Python values, which the Trino adapter passes through `canonical`.
+DF_BODY = {"columns": [
+    {"name": "l_orderkey", "type": "Int64"},
+    {"name": "l_extendedprice", "type": "Decimal128(12, 2)"},
+    {"name": "l_shipdate", "type": "Date32"},
+    {"name": "ts", "type": "Timestamp(ns)"},
+    {"name": "r", "type": "Float32"},
+    {"name": "d", "type": "Float64"},
+    {"name": "l_comment", "type": "Utf8"},
+    {"name": "b", "type": "Boolean"},
+    {"name": "n", "type": "Utf8View"},
+    {"name": "l_quantity", "type": "Decimal128(12, 2)"},
+    {"name": "q4", "type": "Decimal128(38, 4)"}],
+    "rows": [
+        [1, "21168.23", "1996-03-13", "1996-03-13T00:00:00.000000", 0.04, 0.02,
+         "egular courts above the", False, None, "17.00", "17.0000"],
+        [1, "45983.16", "1996-04-12", "1996-04-12T00:00:00.000000", 0.09, 0.06,
+         "ly final dependencies: slyly bold ", False, None, "36.00", "36.0000"]]}
+TRINO_COLUMNS = [
+    ('l_orderkey', 'bigint'),
+    ('l_extendedprice', 'decimal(12, 2)'),
+    ('l_shipdate', 'date'),
+    ('ts', 'timestamp(3)'),
+    ('r', 'real'),
+    ('d', 'double'),
+    ('l_comment', 'varchar'),
+    ('b', 'boolean'),
+    ('n', 'varchar'),
+    ('l_quantity', 'decimal(12, 2)'),
+    ('q4', 'decimal(38, 4)')]
+TRINO_ROWS = [
+    [1, Decimal("21168.23"), dt.date(1996, 3, 13), dt.datetime(1996, 3, 13), 0.04, 0.02,
+     'egular courts above the', False, None, Decimal("17.00"), Decimal("17.0000")],
+    [1, Decimal("45983.16"), dt.date(1996, 4, 12), dt.datetime(1996, 4, 12), 0.09, 0.06,
+     'ly final dependencies: slyly bold ', False, None, Decimal("36.00"), Decimal("36.0000")]]
 
 
-def test_arrow_result_truncation(tmp_path):
-    store = RunStore("r", root=tmp_path)
-    (tmp_path / "r").mkdir()
-    t = pa.table({"n": list(range(10))})
-    assert store.write_result("c", [("n", "Int64")], None, 4, table=t) == "truncated"
-    assert pq.read_table(tmp_path / "r" / "rows" / "c.parquet").num_rows == 4
+def test_df_and_trino_results_store_the_same_json():
+    trino = [[canonical(v) for v in r] for r in TRINO_ROWS]
+    assert trino == DF_BODY["rows"]
+    assert len(TRINO_COLUMNS) == len(DF_BODY["columns"])
 
 
-def test_exec_result_rows_from_table():
-    r = ExecResult(wall_ms=1.0, table=pa.table({"a": [1, 2], "b": ["x", "y"]}))
+def test_exec_result_completed():
+    r = ExecResult(wall_ms=1.0, rows=[[1, "x"], [2, "y"]])
     assert r.completed and r.row_count == 2
-    assert r.as_rows() == [[1, "x"], [2, "y"]]
-    assert ExecResult(wall_ms=None).completed is False
+    assert ExecResult(wall_ms=None).completed is False and ExecResult(wall_ms=None).row_count is None

@@ -1,5 +1,5 @@
 # Single source of truth for every pinned version.
-# `m0 env` passes the images below to Docker Compose; `env.json` of every run
+# `m0 env` passes the images below to Docker Compose; `run.json` of every run
 # records this file's hash plus the resolved image digests.
 
 images:

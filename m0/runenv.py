@@ -1,4 +1,4 @@
-"""Environment manifest for `results/<run-id>/env.json`."""
+"""Environment part of `results/<run-id>/run.json`: git, versions, engines, host."""
 
 import hashlib
 import json
@@ -69,22 +69,29 @@ def _describe(engine) -> dict:
         return {"error": str(e)[:200]}
 
 
-def collect(engines: list, plan: dict) -> dict:
-    lock = versions.load()
-    containers = {}
-    for svc in ["objstore", "catalog", *[e.service for e in engines]]:
+def containers(services: list[str]) -> dict:
+    out = {}
+    for svc in services:
         st = env_local.container_state(svc)
-        containers[svc] = {k: st.get(k) for k in ("id", "image", "mem_limit", "nano_cpus", "started_at")}
+        out[svc] = {k: st.get(k) for k in ("image", "mem_limit", "nano_cpus")}
+    return out
+
+
+def engine_entry(engine) -> dict:
+    """Engine-reported version and key settings, plus hashes of its config files."""
+    return {"info": _describe(engine),
+            "config_hashes": {str(p.relative_to(REPO_ROOT)): file_hash(p) for p in engine.config_files()}}
+
+
+def collect(engines: list) -> dict:
+    lock = versions.load()
     return {
         "git": git_info(),
         "versions_lock_hash": versions.lock_hash(),
-        "versions_lock": lock,
+        "versions": lock,
         "images": image_digests(lock["images"]),
+        "engines": {e.name: engine_entry(e) for e in engines},
+        "containers": containers(["objstore", "catalog", *[e.service for e in engines]]),
         "host": host_info(),
         "wsl": wsl_info(),
-        "engine_configs": {e.name: {str(p.relative_to(REPO_ROOT)): file_hash(p) for p in e.config_files()}
-                           for e in engines},
-        "engine_info": {e.name: _describe(e) for e in engines},
-        "containers": containers,
-        "plan": plan,
     }

@@ -250,8 +250,21 @@ def cmd_run(args: argparse.Namespace) -> Exit:
     state = "interrupted; continue with --resume" if r.interrupted else "done"
     print(f"run {r.run_id}: {r.done}/{r.planned} cells recorded, {r.executed} run now in "
           f"{r.seconds / 60:.1f} min, {r.failed} not ok ({state})")
-    print(f"results {r.dir / 'runs.parquet'}")
+    print(f"results {r.dir}")
     return code
+
+
+def run_state(s, rows: list[dict], planned: int) -> str:
+    from m0 import runner
+
+    pid = runner.lock_holder(s)
+    return f"running (pid {pid})" if pid else "complete" if len(rows) >= planned else "incomplete"
+
+
+def planned_cells(run: dict) -> int:
+    from m0 import plan as plan_mod
+
+    return len(plan_mod.expand(run["plan"])) if run.get("plan") else 0
 
 
 def cmd_status(args: argparse.Namespace) -> Exit:
@@ -268,24 +281,72 @@ def cmd_status(args: argparse.Namespace) -> Exit:
         if not s.exists():
             print_checks([Check("status", FAIL, f"no run {args.run!r} under results/")], args.json)
             return Exit.PREREQUISITE
-    rows, planned, env = s.rows(), s.planned(), s.read_json("env.json")
-    pid = runner.lock_holder(s)
-    state = f"running (pid {pid})" if pid else "complete" if len(rows) >= len(planned) else "incomplete"
+    rows, run = s.rows(), s.read_run()
+    planned = planned_cells(run)
+    state = run_state(s, rows, planned)
     failures = [r for r in rows if r["outcome"] != "ok"]
     last = failures[-1] if failures else None
     counts = runner.summarize_rows(rows)
     if args.json:
-        print(json.dumps({"run_id": s.run_id, "dir": str(s.dir), "state": state, "planned": len(planned),
-                          "recorded": len(rows), "counts": counts, "started_at": env.get("started_at"),
-                          "finished_at": env.get("finished_at"), "last_failure": last}, indent=2, default=str))
+        print(json.dumps({"run_id": s.run_id, "dir": str(s.dir), "state": state, "planned": planned,
+                          "recorded": len(rows), "counts": counts, "started_at": run.get("started_at"),
+                          "finished_at": run.get("finished_at"), "last_failure": last}, indent=2, default=str))
         return Exit.OK
-    print(f"run      {s.run_id} (plan {env.get('plan', {}).get('name')}): {state}")
-    print(f"progress {len(rows)}/{len(planned)} cells; started {env.get('started_at')}, "
-          f"last end {env.get('finished_at')}")
+    print(f"run      {s.run_id} (plan {run.get('plan', {}).get('name')}): {state}")
+    print(f"progress {len(rows)}/{planned} cells; started {run.get('started_at')}, "
+          f"last end {run.get('finished_at')}")
     for engine, c in sorted(counts.items()):
         print(f"{engine:<8} {counts_line(c)}")
     print(f"last failure: {cell_line(last) if last else 'none'}")
     print(f"path     {s.dir}")
+    return Exit.OK
+
+
+def cmd_results(args: argparse.Namespace) -> Exit:
+    from m0 import store
+
+    root = store.RESULTS_DIR
+    patterns = store.keep_patterns(root) + (args.keep or [])
+    runs = []
+    for d in store.run_dirs(root):
+        s = store.RunStore(d.name, root)
+        run, rows = s.read_run(), s.rows()
+        current = bool(run)
+        planned = planned_cells(run) if current else None
+        runs.append({"run_id": d.name, "plan": (run.get("plan") or {}).get("name"),
+                     "started_at": run.get("started_at"), "cells": len(rows), "planned": planned,
+                     "state": run_state(s, rows, planned) if current else "old format",
+                     "bytes": store.dir_bytes(d), "keep": store.is_kept(d.name, patterns)})
+    if args.action == "list":
+        if args.json:
+            print(json.dumps({"dir": str(root), "keep_file": str(root / store.KEEP_FILE),
+                              "runs": runs}, indent=2))
+            return Exit.OK
+        width = max((len(r["run_id"]) for r in runs), default=6)
+        for r in runs:
+            cells = f"{r['cells']}/{r['planned']}" if r["planned"] is not None else str(r["cells"])
+            print(f"{'KEEP' if r['keep'] else '':<5}{r['run_id']:<{width}}  {r['state']:<20} {cells:>9} cells  "
+                  f"{r['bytes'] / 1024**2:7.1f} MiB  {r['started_at'] or '-'}")
+        print(f"-- {len(runs)} runs, {sum(r['keep'] for r in runs)} kept "
+              f"(keep list {root / store.KEEP_FILE})")
+        return Exit.OK
+    # prune: every run not kept and not in progress; a dry run unless --yes
+    doomed = [r for r in runs if not r["keep"] and not r["state"].startswith("running")]
+    if args.yes:
+        for r in doomed:
+            store.delete_run(root / r["run_id"], root)
+    if args.json:
+        print(json.dumps({"deleted" if args.yes else "would_delete": [r["run_id"] for r in doomed],
+                          "kept": [r["run_id"] for r in runs if r not in doomed]}, indent=2))
+        return Exit.OK
+    for r in doomed:
+        print(f"{'DELETED' if args.yes else 'PRUNE':<8} {r['run_id']}  ({r['bytes'] / 1024**2:.1f} MiB)")
+    size = sum(r["bytes"] for r in doomed) / 1024**2
+    if args.yes:
+        print(f"-- deleted {len(doomed)} runs ({size:.1f} MiB), kept {len(runs) - len(doomed)}")
+    else:
+        print(f"-- would delete {len(doomed)} runs ({size:.1f} MiB), keep {len(runs) - len(doomed)}; "
+              f"add --yes to delete")
     return Exit.OK
 
 
@@ -336,6 +397,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", parents=[common], help="progress and last failure of a run")
     p.add_argument("run", nargs="?", default="latest", help="run ID or latest (default)")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("results", parents=[common], help="list runs under results/, prune runs not kept")
+    p.add_argument("action", choices=["list", "prune"])
+    p.add_argument("--keep", action="append",
+                   help="also keep this run ID or glob (repeatable; results/keep.txt lists the rest)")
+    p.add_argument("--yes", action="store_true", help="with prune: delete (default: dry run)")
+    p.set_defaults(func=cmd_results)
     return parser
 
 

@@ -45,6 +45,8 @@ add `--json` for machine-readable output.
 | `m0 data verify --engine df` | Fingerprint every table through an engine and compare with Trino's (`m0 data verify --engine trino` first, with Trino up). Lists every table or column that differs or can't be read. Exit code 3 = differences (findings, not errors). |
 | `m0 run plans/phase-l-smoke.yaml` | Execute a plan (the smoke plan runs `trino` and `df` in ABBA order and switches engines itself); prints non-ok cells and restarts as they happen, then outcome counts. `--query`, `--engine` filter; `--run-id` names the run; `--resume` continues it. Exit code 3 = some cells not ok (expected for the smoke plan). |
 | `m0 status` | Progress and last failure of the latest run (or `m0 status <run-id>`) |
+| `m0 results list` | Every run under `results/` with state, cells, size, and whether `results/keep.txt` keeps it |
+| `m0 results prune` | Dry run: which runs not kept would be deleted. `--yes` deletes them, `--keep <id>` spares one more. Ask the user before `--yes` unless they asked for the cleanup. |
 
 Engines now: `trino` (Trino 484) and `df` (DataFusion 55 in `dfrunner single`). `dfd`
 arrives with step 5.
@@ -75,11 +77,11 @@ If `m0 --help` doesn't list a command, it doesn't exist yet.
 | What `data gen` built (snapshot IDs, timings) | `results/datagen/<suite>_sf<N>.json` |
 | Run plans; queries (manifest + Trino SQL) | `plans/*.yaml`; `queries/manifest.yaml`, `queries/<suite>/<id>.sql` |
 | Outcome rules (engine error → class) | `m0/classify_rules.yaml`, tested with real errors in `tests/fixtures/{trino,df}_errors.yaml` |
-| One row per cell (outcome, wall, CPU, memory) | `results/<run-id>/runs.parquet` (also `cells.jsonl`) |
-| Restarts, cache drops, failures in time order | `results/<run-id>/run.log` |
-| Environment of a run (git, images, host, configs) | `results/<run-id>/env.json` |
-| One cell: SQL, engine stats (Trino query info / dfrunner stats with plan + metrics), memory timeline | `results/<run-id>/cells/<cell_id>/{query.sql, engine_stats.json, memory.csv}` |
-| Result rows of a query's first run | `results/<run-id>/rows/<cell_id>.parquet` |
+| One line per cell: outcome, error line, wall, CPU, memory, time breakdown, restart and cache-drop `events` | `results/<run-id>/cells.jsonl` (fields: `docs/framework-design.md`, "Results") |
+| What and how a run ran: plan (resolved), git, versions, image digests, engine settings and config hashes, host, start/end | `results/<run-id>/run.json` |
+| Result rows of the first completed run per engine × query (capped, canonical JSON) | `results/<run-id>/answers.jsonl` |
+| One cell's SQL, engine stats (Trino query info / dfrunner stats with plan + metrics), memory timeline; only when the plan sets `diag` | `results/<run-id>/diag/<cell_id>/{query.sql, stats.json, memory.csv}` |
+| Runs that `m0 results prune` keeps (run IDs or globs) | `results/keep.txt` |
 | Container logs | `docker compose -p m0 logs <service> --tail 200` (services: `objstore`, `catalog`, `catalog-db`, `catalog-migrate`, `trino`, `df`) |
 | dfrunner live state (versions, pool, running queries) | `curl -s 127.0.0.1:9000/status`; one query: `curl -s 127.0.0.1:9000/queries/<engine_query_id>` |
 
@@ -91,6 +93,7 @@ out the environment before suspecting an engine. Grep logs; don't read them whol
 
 - Runbooks: [preflight](runbooks/preflight.md), [environment](runbooks/environment.md), [data](runbooks/data.md), [run](runbooks/run.md), [troubleshooting](runbooks/troubleshooting.md)
 - `cell_id` is `<engine>.m<mem>.r<round>.<suite>.<query>.i<iteration>`; iteration 0 is
-  the first (cold) run. Query `runs.parquet` with pyarrow; grep `run.log`.
+  the first (cold) run. Query `cells.jsonl` with a short Python one-liner (runbook
+  [run](runbooks/run.md)); don't print it whole.
 - When you understand a new failure pattern, encode it: add a `doctor` check or a
   runbook entry, with a test where possible.

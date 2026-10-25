@@ -3,7 +3,8 @@
 dfrunner API (docs/framework-design.md, "dfrunner API"):
   GET    /health          200 once the catalog is connected
   GET    /status          versions, settings, pool limit / reserved / high-water mark, namespaces
-  POST   /query           {"sql", "query_id"} -> 200 Arrow IPC stream, or 4xx/5xx JSON
+  POST   /query           {"sql", "query_id"} -> 200 {"columns": [{name, type}], "rows": [[...]]}
+                          (canonical JSON values, m0/engines/base.py `canonical`), or 4xx/5xx
                           {"query_id", "error": {variant, contexts, root_message, message}}
   GET    /queries/{id}    final stats: elapsed/planning/execution ms, process CPU, pool peak,
                           rows, error, operator metrics and the plan with metrics
@@ -66,6 +67,37 @@ def engine_error(body: dict | None, status: int) -> EngineError:
                        f"DataFusionError::{err.get('variant')}")
 
 
+EXCHANGE_OPERATORS = ("RepartitionExec", "CoalescePartitionsExec", "SortPreservingMergeExec")
+SCAN_TIMERS = ("time_elapsed_scanning_total", "time_elapsed_processing")  # Parquet scan; Iceberg has none
+
+
+def operator_time(operators: list[dict] | None) -> dict:
+    """Operator time summed per kind, in ms, from dfrunner's per-operator metrics (ns).
+
+    exchange: repartition/merge operators (`elapsed_compute` + `repartition_time` +
+    `send_time`); compute: `elapsed_compute` of every other operator. scan: only if a
+    scan operator reports a scan timer. The Iceberg DataSourceExec decodes inside its
+    stream without one, so `scan_ms` is None for Iceberg tables today and that decode
+    time is in no bucket.
+    """
+    if not operators:
+        return {"scan_ms": None, "exchange_ms": None, "compute_ms": None}
+    scan, exchange, compute = None, 0, 0
+    for op in operators:
+        m = op.get("metrics") or {}
+        name = op.get("op", "")
+        if name == "DataSourceExec" or name.endswith("ScanExec"):
+            timers = [m[k] for k in SCAN_TIMERS if k in m]
+            if timers:
+                scan = (scan or 0) + max(timers)
+        elif name in EXCHANGE_OPERATORS or "Shuffle" in name or "Network" in name:
+            exchange += sum(m.get(k, 0) for k in ("elapsed_compute", "repartition_time", "send_time"))
+        else:
+            compute += m.get("elapsed_compute", 0)
+    return {k: round(ns / 1e6, 3) if ns is not None else None
+            for k, ns in (("scan_ms", scan), ("exchange_ms", exchange), ("compute_ms", compute))}
+
+
 class DfEngine(Engine):
     name = "df"
     service = "df"
@@ -115,7 +147,7 @@ class DfEngine(Engine):
             return False
         try:
             res = self.execute("SELECT 1", timeout_s=30)
-            return res.as_rows() == [[1]]
+            return res.rows == [[1]]
         except Exception:
             return False
 
@@ -130,8 +162,6 @@ class DfEngine(Engine):
     # ---- queries ----
 
     def execute(self, sql: str, timeout_s: float, session: dict | None = None) -> ExecResult:
-        import pyarrow as pa
-
         qid = f"m0-{uuid.uuid4().hex[:16]}"
         result = ExecResult(wall_ms=None, engine_query_id=qid)
 
@@ -143,10 +173,10 @@ class DfEngine(Engine):
                 status, raw, _ = self._request("POST", "/query", {"sql": sql, "query_id": qid},
                                                timeout=timeout_s + CANCEL_GRACE_S + 30)
                 if status == 200:
-                    table = pa.ipc.open_stream(raw).read_all()
+                    body = json.loads(raw)
                     result.wall_ms = (time.perf_counter() - t0) * 1000
-                    result.table = table
-                    result.columns = [(f.name, str(f.type)) for f in table.schema]
+                    result.rows = body["rows"]
+                    result.columns = [(c["name"], c["type"]) for c in body["columns"]]
                 else:
                     result.wall_ms = (time.perf_counter() - t0) * 1000
                     try:
@@ -167,7 +197,7 @@ class DfEngine(Engine):
             result.cancelled = True
             thread.join(CANCEL_GRACE_S)
             result.wall_ms = timeout_s * 1000
-            result.table = None
+            result.rows = None
         return result
 
     def cancel(self, engine_query_id: str) -> None:
@@ -192,6 +222,8 @@ class DfEngine(Engine):
             "engine_elapsed_ms": s.get("elapsed_ms"),
             "engine_cpu_s": s.get("process_cpu_s"),
             "engine_peak_mem_bytes": (s.get("pool") or {}).get("peak"),
+            "planning_ms": s.get("planning_ms"),
+            **operator_time((s.get("metrics") or {}).get("operators")),
         }
 
     def pool_limit_bytes(self) -> int | None:

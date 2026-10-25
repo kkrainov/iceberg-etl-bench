@@ -10,7 +10,7 @@
 // Derived from datafusion-contrib/datafusion-distributed@ee3eacd93af66e4ef2e2e72a253842c723f92ca5:benchmarks/remote-worker/src/main.rs
 // (axum HTTP query endpoint, shared SessionContext, Iceberg integration, abort-on-drop
 // query task, mimalloc). Changes: Iceberg REST catalog, memory pool with high-water
-// mark, disabled disk manager, Arrow IPC results, per-query stats, cancel, structured
+// mark, disabled disk manager, JSON results, per-query stats, cancel, structured
 // errors. The Flight worker server and worker resolution return with `node` mode (step 5).
 
 //! dfrunner: DataFusion query server for the iceberg-etl-bench harness.
@@ -403,11 +403,11 @@ async fn run_query(State(st): State<Shared>, body: Bytes) -> Response {
     }
 
     match outcome {
-        Ok(out) => match query::to_ipc(&out) {
+        Ok(out) => match query::to_json(&out) {
             Ok(buf) => {
                 info!("Query {id} finished: {} rows in {elapsed_ms:.1} ms, pool peak {peak}", rows.unwrap_or(0));
                 let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/vnd.apache.arrow.stream"));
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 let hv = |s: String| HeaderValue::from_str(&s).unwrap_or(HeaderValue::from_static(""));
                 headers.insert("x-dfrunner-query-id", hv(id.clone()));
                 headers.insert("x-dfrunner-elapsed-ms", hv(format!("{elapsed_ms:.3}")));
@@ -416,7 +416,7 @@ async fn run_query(State(st): State<Shared>, body: Bytes) -> Response {
                 (StatusCode::OK, headers, buf).into_response()
             }
             Err(e) => {
-                error!("Query {id}: IPC encoding failed: {e}");
+                error!("Query {id}: JSON encoding failed: {e}");
                 let info = query::error_info(&e);
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"query_id": id, "error": info}))).into_response()
             }

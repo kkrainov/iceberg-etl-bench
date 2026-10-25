@@ -21,7 +21,7 @@ from m0.queries import Query, load_manifest
 COLD_POLICIES = ("per_query", "per_block")
 ENGINES = ("trino", "df", "dfd", "dfd-jo")
 DEFAULTS = {"phase": "L", "rounds": None, "mem_levels": [100], "iterations": 5,
-            "cold": "per_query", "timeout_s": 600, "result_rows_cap": 100_000}
+            "cold": "per_query", "timeout_s": 600, "result_rows_cap": 100_000, "diag": False}
 
 
 class PlanError(Exception):
@@ -83,6 +83,10 @@ def validate(plan: dict, manifest: dict[str, Query] | None = None) -> None:
         raise PlanError("iterations must be >= 0")
     if any(not 0 < int(m) <= 100 for m in plan["mem_levels"]):
         raise PlanError("mem_levels are percentages in (0, 100]")
+    diag = plan.get("diag")
+    if diag is not None and not isinstance(diag, bool) and not (
+            isinstance(diag, list) and all(isinstance(q, str) for q in diag)):
+        raise PlanError("diag is true, false or a list of queries (suite/id)")
     for entry in plan["queries"]:
         for qid in entry.get("ids", []):
             if f"{entry['suite']}/{qid}" not in manifest:
@@ -132,6 +136,12 @@ def expand(plan: dict) -> list[Cell]:
 
 def plan_hash(plan: dict) -> str:
     return hashlib.sha256(json.dumps(plan, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def wants_diag(plan: dict, cell: Cell) -> bool:
+    """Diagnostics (engine stats, memory timeline) for this cell: `diag: true` or a query list."""
+    diag = plan.get("diag")
+    return diag is True or (isinstance(diag, list) and matches(cell, None, diag))
 
 
 def matches(cell: Cell, engines: list[str] | None, queries: list[str] | None) -> bool:

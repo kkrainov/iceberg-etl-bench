@@ -72,7 +72,24 @@ def test_trino_units():
 def test_trim_query_info_drops_stacks():
     info = {"queryId": "q", "state": "FAILED", "errorCode": {"name": "X"},
             "failureInfo": {"type": "T", "message": "m", "stack": ["a"] * 100, "cause": {"type": "C", "message": "c"}},
-            "queryStats": {"elapsedTime": "1.00s", "operatorSummaries": [1] * 1000}, "stages": {"big": 1}}
+            "queryStats": {"elapsedTime": "1.00s", "operatorSummaries": [{"operatorType": "X"}] * 1000}, "stages": {"big": 1}}
     t = trim_query_info(info)
     assert "stack" not in t["failureInfo"] and t["failureInfo"]["cause"]["type"] == "C"
     assert t["queryStats"] == {"elapsedTime": "1.00s"} and "stages" not in t
+
+
+def test_trino_operator_time_breakdown():
+    from m0.engines.trino import TrinoEngine, operator_kind
+
+    ops = [{"operatorType": "TableScanOperator", "getOutputWall": "2.00s"},
+           {"operatorType": "ScanFilterAndProjectOperator", "getOutputWall": "500.00ms"},
+           {"operatorType": "ExchangeOperator", "getOutputWall": "10.00ms"},
+           {"operatorType": "PartitionedOutputOperator", "addInputWall": "5.00ms", "finishWall": "1.00ms"},
+           {"operatorType": "LocalMergeSourceOperator", "getOutputWall": "4.00ms"},
+           {"operatorType": "HashAggregationOperator", "addInputWall": "1.00s", "getOutputWall": "20.00ms"}]
+    info = trim_query_info({"queryStats": {"operatorSummaries": ops, "planningTime": "100.00ms"}})
+    assert info["operatorTime"] == {"scan_ms": 2500.0, "exchange_ms": 20.0, "compute_ms": 1020.0}
+    m = TrinoEngine().metrics(info)
+    assert (m["planning_ms"], m["scan_ms"], m["compute_ms"]) == (100.0, 2500.0, 1020.0)
+    assert operator_kind("LookupJoinOperator") == "compute"
+    assert "operatorSummaries" not in info["queryStats"]

@@ -72,7 +72,7 @@ def test_per_query_iteration_override_and_expect():
 
 @pytest.mark.parametrize("bad", [
     {"engines": ["presto"]}, {"cold": "never"}, {"queries": [{"suite": "tpch", "ids": ["q99"]}]},
-    {"mem_levels": [0]}, {"iterations": -1},
+    {"mem_levels": [0]}, {"iterations": -1}, {"diag": "yes"}, {"diag": [1]},
 ])
 def test_invalid_plans_are_rejected(bad):
     with pytest.raises(plan_mod.PlanError):
@@ -85,6 +85,19 @@ def test_filters():
     assert {c.suite for c in q03} == {"tpch", "tpcds"}
     assert all(c.suite == "tpch" for c in cells if plan_mod.matches(c, ["trino"], ["tpch/q03"]))
     assert not [c for c in cells if plan_mod.matches(c, ["df"], None)]
+
+
+def test_diag_selects_cells():
+    cells = plan_mod.expand(make())
+    assert not any(plan_mod.wants_diag(make(), c) for c in cells)
+    assert all(plan_mod.wants_diag(make(diag=True), c) for c in cells)
+    chosen = [c for c in cells if plan_mod.wants_diag(make(diag=["tpch/q03"]), c)]
+    assert chosen and {(c.suite, c.query_id) for c in chosen} == {("tpch", "q03")}
+
+
+def test_plan_hash_tracks_settings():
+    assert plan_mod.plan_hash(make()) == plan_mod.plan_hash(make())
+    assert plan_mod.plan_hash(make(iterations=3)) != plan_mod.plan_hash(make())
 
 
 @pytest.mark.parametrize("name", ["phase-l-smoke", "phase-l-cold-check"])

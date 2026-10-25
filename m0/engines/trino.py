@@ -9,7 +9,7 @@ import urllib.request
 
 from m0 import env_local
 from m0.classify import EngineError
-from m0.engines.base import Engine, ExecResult
+from m0.engines.base import Engine, ExecResult, canonical
 from m0.paths import CONFIGS_DIR
 
 HOST, PORT, USER, SOURCE = "127.0.0.1", 8080, "m0", "m0-bench"
@@ -21,7 +21,7 @@ CANCEL_GRACE_S = 30
 _DURATION = {"ns": 1e-6, "us": 1e-3, "ms": 1.0, "s": 1e3, "m": 60e3, "h": 3600e3, "d": 86400e3}
 _SIZE = {"B": 1, "kB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
 
-# queryStats fields kept in the per-cell artifact (the full query info is ~250 KB).
+# queryStats fields kept in the diagnostics stats (the full query info is ~250 KB).
 KEEP_STATS = (
     "createTime", "executionStartTime", "endTime", "elapsedTime", "queuedTime", "resourceWaitingTime",
     "executionTime", "analysisTime", "planningTime", "planningCpuTime", "finishingTime",
@@ -72,10 +72,35 @@ def trim_failure(info: dict | None, depth: int = 0) -> dict | None:
     return out
 
 
+SCAN_OPERATORS = ("TableScanOperator", "ScanFilterAndProjectOperator")
+
+
+def operator_kind(operator_type: str) -> str:
+    """scan, exchange (local and remote exchanges, merges, task output) or compute."""
+    if operator_type in SCAN_OPERATORS:
+        return "scan"
+    if any(k in operator_type for k in ("Exchange", "Merge", "Output")):
+        return "exchange"
+    return "compute"
+
+
+def operator_time(stats: dict) -> dict:
+    """Operator wall time (addInput + getOutput + finish) summed per kind, in ms."""
+    ops = stats.get("operatorSummaries")
+    if not ops:
+        return {}
+    out = {"scan_ms": 0.0, "exchange_ms": 0.0, "compute_ms": 0.0}
+    for op in ops:
+        wall = sum(parse_duration_ms(op.get(k)) or 0.0 for k in ("addInputWall", "getOutputWall", "finishWall"))
+        out[f"{operator_kind(op.get('operatorType', ''))}_ms"] += wall
+    return {k: round(v, 3) for k, v in out.items()}
+
+
 def trim_query_info(info: dict) -> dict:
     stats = info.get("queryStats") or {}
     session = info.get("session") or {}
     return {
+        "operatorTime": operator_time(stats),
         "queryId": info.get("queryId"),
         "state": info.get("state"),
         "errorType": info.get("errorType"),
@@ -160,7 +185,7 @@ class TrinoEngine(Engine):
                 cur.execute(sql)
                 rows = cur.fetchall()
                 result.wall_ms = (time.perf_counter() - t0) * 1000
-                result.rows = rows
+                result.rows = [[canonical(v) for v in r] for r in rows]  # outside the clock
                 result.columns = [(d[0], d[1]) for d in (cur.description or [])]
             except trino.exceptions.TrinoQueryError as e:
                 result.wall_ms = (time.perf_counter() - t0) * 1000 if t0 else None
@@ -208,11 +233,16 @@ class TrinoEngine(Engine):
 
     def metrics(self, stats: dict | None) -> dict:
         qs = (stats or {}).get("queryStats") or {}
+        ops = (stats or {}).get("operatorTime") or {}
         cpu_ms = parse_duration_ms(qs.get("totalCpuTime"))
         return {
             "engine_elapsed_ms": parse_duration_ms(qs.get("elapsedTime")),
             "engine_cpu_s": cpu_ms / 1000 if cpu_ms is not None else None,
             "engine_peak_mem_bytes": parse_size_bytes(qs.get("peakTotalMemoryReservation")),
+            "planning_ms": parse_duration_ms(qs.get("planningTime")),
+            "scan_ms": ops.get("scan_ms"),
+            "exchange_ms": ops.get("exchange_ms"),
+            "compute_ms": ops.get("compute_ms"),
         }
 
     def pool_limit_bytes(self) -> int | None:
@@ -224,4 +254,6 @@ class TrinoEngine(Engine):
 
     def describe(self) -> dict:
         status, info = self._get("/v1/info", timeout=5)
-        return {"version": (info or {}).get("nodeVersion", {}).get("version")} if status == 200 else {}
+        out = {"version": (info or {}).get("nodeVersion", {}).get("version")} if status == 200 else {}
+        out["settings"] = read_properties(CONFIG_DIR / "config.properties")
+        return out

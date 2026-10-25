@@ -3,7 +3,7 @@
 `m0 report <run-id>…` fills this template. Two kinds of content:
 
 - **Generated**, written `{{like_this}}`: tables, numbers and charts produced by code
-  from `runs.parquet` and `env.json`. Never edited by hand. If a number looks wrong,
+  from `cells.jsonl` and `run.json`. Never edited by hand. If a number looks wrong,
   fix the code and regenerate.
 - **Written**, marked `<!-- WRITTEN: … -->`: short interpretation by a human or agent.
   Every claim must point to a generated table, chart or finding.
@@ -62,7 +62,7 @@ the pre-registered methodology version.
 ## 1. What was compared
 
 {{systems_table}}
-<!-- Generated from env.json: engine, version/commit, mode, key non-default config,
+<!-- Generated from run.json: engine, version/commit, mode, key non-default config,
      with a link to the full config. -->
 
 {{hardware_table}}

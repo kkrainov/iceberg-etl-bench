@@ -31,8 +31,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 2 | Data generation | M | ✅ done |
 | 3a | Measurement core with Trino | M | ✅ done |
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
-| 3c | Simplify result storage (JSON only, fewer artifacts) | S | next |
-| 4 | Analysis: diff, stats, summaries, full query catalogue | M | |
+| 3c | Simplify result storage (JSON only, fewer artifacts) | S | ✅ done |
+| 4 | Analysis: diff, stats, summaries, full query catalogue | M | next |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
@@ -329,7 +329,7 @@ sampler.
   parameter).
 - Rust build time in WSL. Cache target directories.
 
-## Step 3c: simplify result storage
+## Step 3c: simplify result storage ✅
 
 **Goal.** A run records what was tested, how it was configured and what was measured,
 in plain JSON, and nothing more. Requested by the user on 2026-10-25: the step 3a/3b
@@ -390,6 +390,39 @@ results/<run-id>/
 **Note for step 4:** analysis reads `cells.jsonl` with the standard library (or
 DuckDB ad hoc). There's no dataframe dependency unless step 4 shows a real need.
 
+**Done (2026-10-25).** Evidence, re-checked by the lead agent:
+- Reference run `phase-l-smoke-20261025-115110Z`: 132/132 cells in 7.2 min. `trino`
+  ok 64, err_mem 2 (X1_mem, expected); `df` ok 64, timeout 2 (X1_mem, finding F1).
+  The run directory holds only `run.json`, `cells.jsonl`, `answers.jsonl`
+  (170 KB in total).
+- `--resume` on it runs 0 cells. `--resume` refuses a run whose resolved plan hash
+  changed. `m0 status` and `m0 results list/prune` work; prune is a dry run without
+  `--yes` and keeps runs listed in `results/keep.txt`.
+- `pyarrow` is gone from `pyproject.toml` and `uv.lock`. dfrunner returns JSON; both
+  adapters encode values one way per type (`canonical()` in `m0/engines/base.py`,
+  `to_json` in `dfrunner/src/query.rs`). A live query with every common type gave
+  identical JSON from both engines; it is the fixture of a test.
+- Tests: 125 → 136 (8 tests of removed Parquet/Arrow code dropped, 19 added).
+- Six scratch runs deleted. `results/datagen/` and `results/verify/` untouched.
+
+**Shapes:** the cell record has 36 fields (identity, cold protocol with `events`,
+time incl. `planning_ms` and the `scan_ms` / `exchange_ms` / `compute_ms` breakdown,
+memory, outcome, result). Field list in framework-design.md, "Results". `diag/` is
+written only for cells named by the plan key `diag`.
+
+**Deviations and findings:**
+- `answers.jsonl` keeps the first *completed* cell per engine × query, not
+  iteration 0, so a query whose first run failed still has an answer.
+- Per-cell engine stats are no longer stored unless the plan sets `diag`. Full error
+  text is still in the engines' live endpoints; `m0 repro --diag` (step 4b) brings it
+  back on demand.
+- In the smoke answers, 6 of 8 queries match exactly. tpch q01 and tpcds q07 differ
+  only in `avg` decimal scale (the 3b finding below).
+- `df` `scan_ms` is always null: the Iceberg `DataSourceExec` has no scan timer, so
+  decode time falls in no bucket. Trino's `scan_ms` is operator wall time summed over
+  threads and includes S3 waits. The breakdown compares within an engine; across
+  engines only roughly.
+
 ## Step 4: analysis, plus the full query catalogue
 
 **Carried over from 3b:**
@@ -398,6 +431,13 @@ DuckDB ad hoc). There's no dataframe dependency unless step 4 shows a real need.
   must compare at Trino's scale.
 - **Stale schemas.** `df` caches table schemas per process, so restart it after data is
   regenerated.
+
+**Carried over from 3c:**
+- The differ reads `answers.jsonl` (canonical JSON values plus each engine's type
+  names) and `cells.jsonl`, with the standard library.
+- Step 5's time-breakdown experiment needs a scan timer for `df`: either wrap the
+  Iceberg scan in dfrunner or report scan as total minus exchange and compute, and say
+  which.
 
 **Goal.** Turn raw cells into answers.
 

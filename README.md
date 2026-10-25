@@ -58,6 +58,11 @@ uv run m0 env down                     # stop; data is kept
 
 Then `uv run m0 data gen --suite tpch --sf 1` (and `tpcds`, `etl`) and
 `uv run m0 run plans/phase-l-smoke.yaml` (Trino and DataFusion in ABBA order).
+A run writes plain JSON to `results/<run-id>/`: `run.json` (plan and environment),
+`cells.jsonl` (one line per measured cell) and `answers.jsonl` (result rows for the
+correctness check). `uv run m0 status` shows its progress, `uv run m0 results list`
+lists runs, and `uv run m0 results prune --yes` deletes runs not named in
+`results/keep.txt`.
 `uv run m0 data verify --engine df` checks that DataFusion reads every table with the
 same values as Trino. Planned, not implemented yet: `m0 summarize`
 and the rest of the CLI in [framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).

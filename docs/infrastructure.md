@@ -12,7 +12,7 @@
 | OS | Windows host, WSL2 Ubuntu 26.04, kernel 6.18, systemd, cgroup v2 |
 | Containers | Docker Engine 29.x inside WSL |
 
-`m0 doctor` records all of this in `env.json`.
+`m0 doctor` checks all of this; every run records it in its `run.json`.
 
 ### WSL and host settings
 

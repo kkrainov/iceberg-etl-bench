@@ -1,49 +1,69 @@
-"""Result store: `results/<run-id>/`.
+"""Result store: `results/<run-id>/` (docs/framework-design.md, "Results").
 
-Layout (also in the skill's file map):
-  plan.yaml          the plan as run (resume refuses a changed plan)
-  cells.json         every planned cell, in execution order
-  cells.jsonl        one JSON line per recorded cell, appended as cells finish (the source of truth)
-  runs.parquet       the same rows as a table, rebuilt from cells.jsonl
-  env.json           environment manifest
-  run.log            timestamped events: restarts, cache drops, non-ok cells
-  cells/<cell_id>/   query.sql, engine_stats.json, memory.csv
-  rows/<cell_id>.parquet   result rows of every iteration-0 cell (capped), for the differ
+  run.json       what and how: plan (file, hash, resolved settings), git, pinned versions,
+                 image digests, engine settings and config hashes, host, start/end, resumes
+  cells.jsonl    one JSON line per finished cell, appended (the only measurements file)
+  answers.jsonl  result rows of the first completed run per engine x query (capped)
+  diag/<cell_id>/  query.sql, stats.json, memory.csv; only for cells the plan's `diag` selects
+
+Planned cells aren't stored: `m0.plan.expand(run.json["plan"])` gives them again.
 """
 
+import fnmatch
 import json
 import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 from m0.paths import RESULTS_DIR
 
-RESULT_BYTES_CAP = 64 * 1024**2
+ANSWER_BYTES_CAP = 64 * 1024**2
+# Directories under results/ that hold other artifacts; never listed or pruned as runs.
+NOT_RUNS = ("datagen", "verify")
+KEEP_FILE = "keep.txt"
 
-SCHEMA = pa.schema([
-    ("run_id", pa.string()), ("cell_id", pa.string()), ("seq", pa.int32()), ("block", pa.int32()),
-    ("phase", pa.string()), ("plan", pa.string()), ("engine", pa.string()), ("engine_variant", pa.string()),
-    ("suite", pa.string()), ("query_id", pa.string()), ("round", pa.int32()), ("iteration", pa.int32()),
-    ("cold", pa.bool_()), ("cold_policy", pa.string()), ("restart_s", pa.float64()),
-    ("cache_dropped", pa.bool_()), ("mem_level", pa.int32()), ("concurrency", pa.int32()),
-    ("client_id", pa.int32()), ("started_at", pa.string()), ("wall_ms", pa.float64()),
-    ("engine_elapsed_ms", pa.float64()), ("cpu_s", pa.float64()), ("engine_cpu_s", pa.float64()),
-    ("peak_mem_bytes", pa.int64()), ("peak_mem_source", pa.string()), ("mem_start_bytes", pa.int64()),
-    ("engine_peak_mem_bytes", pa.int64()), ("mem_limit_bytes", pa.int64()), ("pool_limit_bytes", pa.int64()),
-    ("objstore_peak_mem_bytes", pa.int64()), ("objstore_cpu_s", pa.float64()), ("oom_kills", pa.int32()),
-    ("mem_samples", pa.int32()), ("outcome", pa.string()), ("expected_outcome", pa.string()),
-    ("error_class", pa.string()), ("error_line", pa.string()), ("unrecognised", pa.bool_()),
-    ("engine_query_id", pa.string()), ("rows", pa.int64()), ("result_stored", pa.string()),
-    ("result_hash", pa.string()), ("diff_status", pa.string()), ("nodes", pa.int32()),
-    ("instance_type", pa.string()), ("spot_usd_per_h", pa.float64()),
-])
+# One cells.jsonl line (docs/framework-design.md, "Results" has the meaning of each).
+FIELDS = (
+    # identity
+    "cell_id", "seq", "block", "round", "engine", "mem_level", "suite", "query_id", "iteration",
+    # cold protocol and events before the cell (restart, cache_drop)
+    "cold", "events",
+    # time (harness wall clock, cgroup CPU, engine-reported numbers and time breakdown)
+    "started_at", "wall_ms", "cpu_s", "engine_elapsed_ms", "engine_cpu_s", "planning_ms", "scan_ms",
+    "exchange_ms", "compute_ms",
+    # memory
+    "peak_mem_bytes", "peak_mem_source", "engine_peak_mem_bytes", "mem_limit_bytes", "pool_limit_bytes",
+    "objstore_peak_mem_bytes", "oom_kills",
+    # outcome
+    "outcome", "expected_outcome", "error_class", "error_line", "unrecognised", "engine_query_id",
+    # result
+    "rows", "answer",
+)
 
 
 def now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:  # torn last line after a hard kill
+                continue
+    return out
+
+
+def append_jsonl(path: Path, record: dict) -> None:
+    with path.open("a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 class RunStore:
@@ -57,166 +77,97 @@ class RunStore:
         return self.dir / "cells.jsonl"
 
     @property
-    def parquet(self) -> Path:
-        return self.dir / "runs.parquet"
+    def answers_path(self) -> Path:
+        return self.dir / "answers.jsonl"
 
-    def cell_dir(self, cell_id: str) -> Path:
-        d = self.dir / "cells" / cell_id
+    def diag_dir(self, cell_id: str) -> Path:
+        d = self.dir / "diag" / cell_id
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def exists(self) -> bool:
-        return (self.dir / "plan.yaml").is_file()
+        return (self.dir / "run.json").is_file()
 
-    # ---- run-level files ----
-    def init(self, plan_text: str, cells: list[dict]) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "plan.yaml").write_text(plan_text)
-        (self.dir / "cells.json").write_text(json.dumps(cells, indent=1))
-
-    def plan_text(self) -> str:
-        return (self.dir / "plan.yaml").read_text()
-
-    def planned(self) -> list[dict]:
-        path = self.dir / "cells.json"
-        return json.loads(path.read_text()) if path.is_file() else []
-
-    def write_json(self, name: str, data: dict) -> None:
-        tmp = self.dir / f".{name}.tmp"
-        tmp.write_text(json.dumps(data, indent=2, default=str))
-        tmp.replace(self.dir / name)
-
-    def read_json(self, name: str) -> dict:
-        path = self.dir / name
+    # ---- run.json ----
+    def read_run(self) -> dict:
+        path = self.dir / "run.json"
         return json.loads(path.read_text()) if path.is_file() else {}
 
-    def log(self, message: str) -> None:
+    def write_run(self, data: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        with (self.dir / "run.log").open("a") as f:
-            f.write(f"{now()} {message}\n")
+        tmp = self.dir / ".run.json.tmp"
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        tmp.replace(self.dir / "run.json")
 
     # ---- cells ----
     def rows(self) -> list[dict]:
-        if not self.jsonl.is_file():
-            return []
-        out = []
-        for line in self.jsonl.read_text().splitlines():
-            if line.strip():
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:  # torn last line after a hard kill
-                    continue
-        return out
+        return read_jsonl(self.jsonl)
 
     def recorded(self) -> set[str]:
         return {r["cell_id"] for r in self.rows()}
 
     def append(self, row: dict) -> None:
-        unknown = set(row) - set(SCHEMA.names)
-        if unknown:
-            raise ValueError(f"columns not in schema: {sorted(unknown)}")
-        with self.jsonl.open("a") as f:
-            f.write(json.dumps(row, default=str) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        if unknown := set(row) - set(FIELDS):
+            raise ValueError(f"fields not in FIELDS: {sorted(unknown)}")
+        append_jsonl(self.jsonl, {k: row.get(k) for k in FIELDS})
 
-    def write_parquet(self) -> Path:
-        rows = self.rows()
-        table = pa.Table.from_pylist([{k: r.get(k) for k in SCHEMA.names} for r in rows], schema=SCHEMA)
-        tmp = self.dir / ".runs.parquet.tmp"
-        pq.write_table(table, tmp)
-        tmp.replace(self.parquet)
-        return self.parquet
+    # ---- answers ----
+    def answers(self) -> list[dict]:
+        return read_jsonl(self.answers_path)
 
-    # ---- result rows ----
-    def write_result(self, cell_id: str, columns: list[tuple[str, str]], rows: list[list] | None,
-                     max_rows: int, table: pa.Table | None = None) -> str:
-        """Store result rows as Parquet; returns 'full' or 'truncated'.
+    def answered(self) -> set[tuple[str, str, str]]:
+        return {(a["engine"], a["suite"], a["query_id"]) for a in self.answers()}
 
-        Either `rows` with engine type names in `columns` (Trino), or an Arrow `table`
-        (DataFusion). Both end up with the comparable Arrow types of `comparable_type`.
-        """
-        if table is not None:
-            total = table.num_rows
-            table = normalize_table(table.slice(0, max_rows), columns)
-        else:
-            total = len(rows)
-            table = result_table(columns, rows[:max_rows])
-        status = "full" if table.num_rows == total else "truncated"
-        while table.nbytes > RESULT_BYTES_CAP and table.num_rows > 1:
-            table, status = table.slice(0, table.num_rows // 2), "truncated"
-        d = self.dir / "rows"
-        d.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, d / f"{cell_id}.parquet")
+    def write_answer(self, cell: dict, columns: list[tuple[str, str]], rows: list[list], max_rows: int) -> str:
+        """Append one answer (rows already canonical JSON); returns 'full' or 'truncated'."""
+        kept, size = [], 0
+        for r in rows[:max_rows]:
+            size += len(json.dumps(r, default=str))
+            if size > ANSWER_BYTES_CAP:
+                break
+            kept.append(r)
+        status = "full" if len(kept) == len(rows) else "truncated"
+        append_jsonl(self.answers_path, {
+            "cell_id": cell["cell_id"], "engine": cell["engine"], "suite": cell["suite"],
+            "query_id": cell["query_id"], "columns": [{"name": n, "type": t} for n, t in columns],
+            "row_count": len(rows), "truncated": status == "truncated", "rows": kept})
         return status
 
 
-def arrow_type(engine_type: str) -> pa.DataType | None:
-    """Arrow type for a Trino type name, None to let pyarrow infer."""
-    t = engine_type.lower().replace(" ", "")
-    simple = {"boolean": pa.bool_(), "tinyint": pa.int8(), "smallint": pa.int16(), "integer": pa.int32(),
-              "bigint": pa.int64(), "real": pa.float32(), "double": pa.float64(), "date": pa.date32(),
-              "varbinary": pa.binary()}
-    if t in simple:
-        return simple[t]
-    if t.startswith(("varchar", "char")):
-        return pa.string()
-    if t.startswith("decimal("):
-        p, s = (int(x) for x in t[8:-1].split(","))
-        return pa.decimal128(p, s)
-    if t.startswith("timestamp(") and "withtimezone" not in t:
-        return pa.timestamp("us")
-    return None
+# ---- runs under results/ ----
 
-
-def comparable_type(t: pa.DataType) -> pa.DataType:
-    """Arrow type used in stored results, so both engines' results compare (step 4 differ).
-
-    Physical-layout variants collapse to one logical type: string/binary views and large
-    variants -> string/binary, dictionaries -> their value type, lists recursively.
-    Numeric, decimal, date and timestamp types are kept as the engine returned them
-    (the differ normalises decimals by scale and timestamps to UTC, methodology 8).
-    """
-    if pa.types.is_dictionary(t):
-        return comparable_type(t.value_type)
-    if pa.types.is_string_view(t) or pa.types.is_large_string(t):
-        return pa.string()
-    if pa.types.is_binary_view(t) or pa.types.is_large_binary(t):
-        return pa.binary()
-    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_list_view(t) or pa.types.is_large_list_view(t):
-        return pa.list_(comparable_type(t.value_type))
-    return t
-
-
-def normalize_table(table: pa.Table, columns: list[tuple[str, str]] | None = None) -> pa.Table:
-    arrays = []
-    for col in table.columns:
-        target = comparable_type(col.type)
-        arrays.append(col if target == col.type else col.cast(target))
-    names = table.column_names
-    types = [t for _, t in columns] if columns else [str(f.type) for f in table.schema]
-    meta = {"engine_types": json.dumps(types)}
-    return pa.Table.from_arrays(arrays, names=names).replace_schema_metadata(meta)
-
-
-def result_table(columns: list[tuple[str, str]], rows: list[list]) -> pa.Table:
-    arrays, names = [], []
-    for i, (name, engine_type) in enumerate(columns):
-        values = [r[i] for r in rows]
-        typ = arrow_type(engine_type)
-        try:
-            arr = pa.array(values, type=typ)
-        except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError):
-            arr = pa.array([None if v is None else str(v) for v in values], type=pa.string())
-        arrays.append(arr)
-        names.append(name)  # compared by position (methodology 8), so repeated names are fine
-    meta = {"engine_types": json.dumps([t for _, t in columns])}
-    return pa.Table.from_arrays(arrays, names=names).replace_schema_metadata(meta)
+def run_dirs(root: Path = RESULTS_DIR) -> list[Path]:
+    """Run directories: anything with run.json, cells.jsonl or an old-format plan.yaml."""
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if p.is_dir() and p.name not in NOT_RUNS
+                  and any((p / f).is_file() for f in ("run.json", "cells.jsonl", "plan.yaml")))
 
 
 def list_runs(root: Path = RESULTS_DIR) -> list[RunStore]:
-    """Runs ordered by start time (oldest first)."""
-    if not root.is_dir():
+    """Runs in the current format, ordered by start time (oldest first)."""
+    runs = [RunStore(p.name, root) for p in run_dirs(root) if (p / "run.json").is_file()]
+    return sorted(runs, key=lambda r: (r.read_run().get("started_at") or "", r.run_id))
+
+
+def keep_patterns(root: Path = RESULTS_DIR) -> list[str]:
+    """Run IDs or glob patterns in results/keep.txt (one per line, `#` comments)."""
+    path = root / KEEP_FILE
+    if not path.is_file():
         return []
-    runs = [RunStore(p.name, root) for p in root.iterdir() if (p / "plan.yaml").is_file()]
-    return sorted(runs, key=lambda r: (r.read_json("env.json").get("started_at") or "", r.run_id))
+    lines = (line.split("#", 1)[0].strip() for line in path.read_text().splitlines())
+    return [line for line in lines if line]
+
+
+def is_kept(run_id: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(run_id, p) for p in patterns)
+
+
+def dir_bytes(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def delete_run(path: Path, root: Path = RESULTS_DIR) -> None:
+    if path.parent != root or path.name in NOT_RUNS:
+        raise ValueError(f"not a run directory: {path}")
+    shutil.rmtree(path)

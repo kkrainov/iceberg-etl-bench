@@ -3,7 +3,8 @@
 Per cell: (restart engine + drop page cache when the cold policy says so, or
 after `killed`/`unresponsive`) -> start the cgroup sampler -> execute and fetch
 all rows (harness clock) -> stop the sampler -> health check -> final engine
-stats -> classify -> append one row to cells.jsonl plus per-cell artifacts.
+stats -> classify -> append one line to cells.jsonl (plus the answer of the first
+completed run per engine x query, and diagnostics when the plan asks for them).
 """
 
 import json
@@ -51,7 +52,7 @@ def default_run_id(plan: dict) -> str:
 
 def resolve_run(plan: dict, run_id: str | None, resume: bool) -> RunStore:
     if run_id is None and resume:
-        same = [r for r in list_runs() if r.read_json("env.json").get("plan", {}).get("name") == plan["name"]]
+        same = [r for r in list_runs() if r.read_run().get("plan", {}).get("name") == plan["name"]]
         if not same:
             raise RunRefused(f"--resume: no earlier run of plan {plan['name']!r}; give --run-id")
         return same[-1]
@@ -89,7 +90,7 @@ class Runner:
                  emit=None):
         self.plan_path = Path(plan_path)
         self.plan = plan_mod.load(self.plan_path)
-        self.plan_text = self.plan_path.read_text()
+        self.plan_hash = plan_mod.plan_hash(self.plan)
         self.cells = plan_mod.expand(self.plan)
         self.manifest = load_manifest()
         self.store = resolve_run(self.plan, run_id, resume)
@@ -97,6 +98,7 @@ class Runner:
         self.engine_filter, self.query_filter = engine_filter, query_filter
         self.emit = emit or (lambda kind, payload: None)
         self.adapters: dict = {}
+        self.answered: set = set()
 
     # ---- setup ----
     def prepare(self) -> list[plan_mod.Cell]:
@@ -104,8 +106,9 @@ class Runner:
         if s.exists():
             if not self.resume:
                 raise RunRefused(f"run {s.run_id} already exists; add --resume to continue it")
-            if s.plan_text() != self.plan_text:
-                raise RunRefused(f"plan {self.plan_path} changed since run {s.run_id} started; use a new run ID")
+            if s.read_run().get("plan_hash") != self.plan_hash:
+                raise RunRefused(f"plan {self.plan_path} changed since run {s.run_id} started (compare with "
+                                 f"`plan` in its run.json); use a new run ID")
             if pid := lock_holder(s):
                 raise RunRefused(f"run {s.run_id} is in progress (pid {pid})")
         todo_all = [c for c in self.cells if plan_mod.matches(c, self.engine_filter, self.query_filter)]
@@ -117,23 +120,24 @@ class Runner:
         for svc in ("objstore", "catalog"):
             if not env_local.container_state(svc).get("running"):
                 raise RunPrerequisite(f"{svc} is not running; start the stack with `m0 env up --engine trino`")
-        if not s.exists():
-            s.init(self.plan_text, [c.to_dict() for c in self.cells])
         recorded = s.recorded()
+        self.answered = s.answered()
         self.adapters = {e: engines.get(e) for e in sorted({c.engine for c in todo_all})}
         return [c for c in todo_all if c.cell_id not in recorded]
 
-    def write_env(self) -> None:
-        env = self.store.read_json("env.json")
-        snapshot = runenv.collect(list(self.adapters.values()), self.plan)
-        if not env:
-            env = {"run_id": self.store.run_id, "plan_file": str(self.plan_path), "plan_hash":
-                   plan_mod.plan_hash(self.plan), "started_at": now(), "finished_at": None, "resumes": [],
-                   **snapshot}
+    def write_run_json(self) -> None:
+        """New run: plan and environment. Resumed run: one more entry under `resumes`."""
+        run = self.store.read_run()
+        snapshot = runenv.collect(list(self.adapters.values()))
+        if not run:
+            run = {"run_id": self.store.run_id, "plan_file": str(self.plan_path), "plan_hash": self.plan_hash,
+                   "plan": self.plan, "started_at": now(), "finished_at": None, "resumes": [], **snapshot}
         else:
-            env["resumes"].append({"at": now(), "git": snapshot["git"], "images": snapshot["images"],
+            for name, entry in snapshot["engines"].items():
+                run["engines"].setdefault(name, entry)
+            run["resumes"].append({"at": now(), "git": snapshot["git"], "images": snapshot["images"],
                                    "containers": snapshot["containers"]})
-        self.store.write_json("env.json", env)
+        self.store.write_run(run)
 
     def check_namespaces(self, todo: list[plan_mod.Cell]) -> None:
         """Every namespace the cells need exists in the Iceberg catalog (engine-neutral)."""
@@ -147,25 +151,24 @@ class Runner:
             raise RunPrerequisite(f"missing namespaces {missing}; run `m0 data gen` for them")
 
     def record_engine_info(self, eng) -> None:
-        """Engine-reported versions and settings into env.json, once per engine and run."""
-        env = self.store.read_json("env.json")
-        info = env.setdefault("engine_info", {})
-        if env and (not info.get(eng.name) or "error" in info.get(eng.name, {})):
-            info[eng.name] = eng.describe()
-            self.store.write_json("env.json", env)
+        """Engine-reported version and settings into run.json, once the engine is up."""
+        run = self.store.read_run()
+        entry = run.get("engines", {}).get(eng.name)
+        if entry is not None and (not entry.get("info") or "error" in entry["info"]):
+            entry["info"] = eng.describe()
+            self.store.write_run(run)
 
     # ---- execution ----
     def run(self) -> RunResult:
         start = time.monotonic()
         todo = self.prepare()
         s = self.store
+        s.dir.mkdir(parents=True, exist_ok=True)
         (s.dir / "run.lock").write_text(str(os.getpid()))
         executed, interrupted = 0, False
         try:
             if todo:
-                self.write_env()
-            s.log(f"start: {len(todo)} cells to run of {len(self.cells)} planned"
-                  f"{' (resume)' if self.resume else ''}")
+                self.write_run_json()
             self.emit("start", {"run_id": s.run_id, "todo": len(todo), "planned": len(self.cells), "dir": str(s.dir)})
             if todo:
                 self.check_namespaces(todo)
@@ -173,27 +176,26 @@ class Runner:
             prev_block, restart_reason = None, None
             for cell in todo:
                 eng = self.adapters[cell.engine]
-                restart_s, dropped = None, False
+                events, dropped = [], False
                 # A block's first executed cell is always cold, also when --query/--resume
                 # skipped the cell the plan marked; a restart after a failure is not.
                 cold = cell.restart_before or (cell.block != prev_block and cell.iteration == 0)
                 if cold or restart_reason or cell.block != prev_block:
                     why = f"after {restart_reason}" if restart_reason else "cold run" if cold else "new block"
                     restart_s = eng.restart()
-                    s.log(f"restart {eng.name} before {cell.cell_id} ({why}): {restart_s:.1f}s")
+                    events.append({"event": "restart", "reason": why, "s": round(restart_s, 1)})
                     self.record_engine_info(eng)
                     if restart_reason:
                         self.emit("event", f"restarted {eng.name} after {restart_reason} ({restart_s:.0f}s)")
                     if cold:
                         drop_s = env_local.drop_page_cache()
                         dropped = True
-                        s.log(f"page cache dropped before {cell.cell_id}: {drop_s:.1f}s")
+                        events.append({"event": "cache_drop", "s": round(drop_s, 1)})
                     restart_reason = None
-                row = self.execute_cell(cell, eng, restart_s, dropped)
+                row = self.execute_cell(cell, eng, events, dropped)
                 executed += 1
                 prev_block = cell.block
                 if row["outcome"] != "ok":
-                    s.log(f"{row['outcome']} {cell.cell_id}: {row['error_line']}")
                     self.emit("cell", row)
                 if row["outcome"] in RESTART_AFTER:
                     restart_reason = row["outcome"]
@@ -204,24 +206,20 @@ class Runner:
                     restart_reason = "timeout (engine still busy after cancel)"
         except KeyboardInterrupt:
             interrupted = True
-            s.log("interrupted")
         finally:
-            s.write_parquet()
-            env = s.read_json("env.json")
-            if env and executed:
-                env["finished_at"] = now()
-                s.write_json("env.json", env)
+            run = s.read_run()
+            if run and executed:
+                run["finished_at"] = now()
+                s.write_run(run)
             (s.dir / "run.lock").unlink(missing_ok=True)
         rows = s.rows()
         return RunResult(s.run_id, s.dir, len(self.cells), len(rows), executed, time.monotonic() - start,
                          summarize_rows(rows), sum(r["outcome"] != "ok" for r in rows), interrupted)
 
-    def execute_cell(self, cell: plan_mod.Cell, eng, restart_s: float | None, dropped: bool) -> dict:
+    def execute_cell(self, cell: plan_mod.Cell, eng, events: list[dict], dropped: bool) -> dict:
         s, plan = self.store, self.plan
         q = self.manifest[f"{cell.suite}/{cell.query_id}"]
         sql = render_for(q, plan["sf"], cell.engine)
-        cdir = s.cell_dir(cell.cell_id)
-        (cdir / "query.sql").write_text(sql + "\n")
         eng_state = env_local.container_state(eng.service)
         obj_state = env_local.container_state("objstore")
         sampler = Sampler({"engine": Cgroup(cgroup_dir(eng_state["id"]) if eng_state.get("id") else None),
@@ -230,42 +228,38 @@ class Runner:
         sampler.start()
         res = eng.execute(sql, timeout_s=cell.timeout_s or float(plan["timeout_s"]))
         m = sampler.stop()
-        sampler.write_timeline(cdir / "memory.csv")
 
         after = env_local.container_state(eng.service)
         running = bool(after.get("running")) and after.get("id") == eng_state.get("id")
         healthy = running and eng.health()
         stats = eng.stats(res.engine_query_id) if healthy and res.engine_query_id else None
-        if stats is not None:
-            (cdir / "engine_stats.json").write_text(json.dumps(stats, indent=1))
-        em = eng.metrics(stats)
         cls = classify(Signals(
             engine=eng.name, error=res.error, client_error=res.client_error, timed_out=res.timed_out,
             oom_kills=m["engine"].oom_kills, container_oom_killed=bool(after.get("oom_killed")) and not running,
             container_running=running, container_exit_code=after.get("exit_code") if not running else None,
             healthy_after=healthy))
+        if plan_mod.wants_diag(plan, cell):
+            d = s.diag_dir(cell.cell_id)
+            (d / "query.sql").write_text(sql + "\n")
+            (d / "stats.json").write_text(json.dumps(stats, indent=1))
+            sampler.write_timeline(d / "memory.csv")
 
-        result_stored = None
-        if cell.iteration == 0 and res.completed:
-            result_stored = s.write_result(cell.cell_id, res.columns, res.rows, int(plan["result_rows_cap"]),
-                                           table=res.table)
         row = {
-            "run_id": s.run_id, "cell_id": cell.cell_id, "seq": cell.seq, "block": cell.block,
-            "phase": plan["phase"], "plan": plan["name"], "engine": cell.engine, "engine_variant": "baseline",
-            "suite": cell.suite, "query_id": cell.query_id, "round": cell.round, "iteration": cell.iteration,
-            "cold": cell.iteration == 0 and dropped, "cold_policy": plan["cold"], "restart_s": restart_s, "cache_dropped": dropped,
-            "mem_level": cell.mem_level, "concurrency": 1, "client_id": 0, "started_at": started_at,
-            "wall_ms": res.wall_ms, **em,
-            "cpu_s": m["engine"].cpu_s, "peak_mem_bytes": m["engine"].peak_bytes,
-            "peak_mem_source": m["engine"].peak_source, "mem_start_bytes": m["engine"].start_bytes,
+            "cell_id": cell.cell_id, "seq": cell.seq, "block": cell.block, "round": cell.round,
+            "engine": cell.engine, "mem_level": cell.mem_level, "suite": cell.suite, "query_id": cell.query_id,
+            "iteration": cell.iteration, "cold": cell.iteration == 0 and dropped, "events": events,
+            "started_at": started_at, "wall_ms": round(res.wall_ms, 3) if res.wall_ms is not None else None,
+            "cpu_s": m["engine"].cpu_s, **eng.metrics(stats),
+            "peak_mem_bytes": m["engine"].peak_bytes, "peak_mem_source": m["engine"].peak_source,
             "mem_limit_bytes": eng_state.get("mem_limit"), "pool_limit_bytes": eng.pool_limit_bytes(),
-            "objstore_peak_mem_bytes": m["objstore"].peak_bytes, "objstore_cpu_s": m["objstore"].cpu_s,
-            "oom_kills": m["engine"].oom_kills, "mem_samples": m["engine"].samples,
+            "objstore_peak_mem_bytes": m["objstore"].peak_bytes, "oom_kills": m["engine"].oom_kills,
             "outcome": cls.outcome, "expected_outcome": cell.expect, "error_class": cls.error_class,
             "error_line": cls.error_line, "unrecognised": cls.unrecognised,
-            "engine_query_id": res.engine_query_id, "rows": res.row_count,
-            "result_stored": result_stored, "result_hash": None, "diff_status": "pending",
-            "nodes": 1, "instance_type": None, "spot_usd_per_h": None,
+            "engine_query_id": res.engine_query_id, "rows": res.row_count, "answer": None,
         }
+        key = (cell.engine, cell.suite, cell.query_id)
+        if res.completed and key not in self.answered:
+            row["answer"] = s.write_answer(row, res.columns, res.rows, int(plan["result_rows_cap"]))
+            self.answered.add(key)
         s.append(row)
         return row

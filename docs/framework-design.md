@@ -33,10 +33,10 @@
 ```text
                      ┌──────────────── m0 (Python CLI) ────────────────┐
  plans/*.yaml ──────▶│ plan expander → scheduler → engine adapters     │──▶ results/<run-id>/
- queries/**          │ metrics sampler · classifier · differ · stats   │      runs.parquet, *.jsonl,
- configs/**          │ summarize · compare · report                    │      logs/, plans/, env.json
+ queries/**          │ metrics sampler · classifier · differ · stats   │      run.json, cells.jsonl,
+ configs/**          │ summarize · compare · report                    │      answers.jsonl, diag/
                      └──────────┬───────────────────────┬──────────────┘
-                                │ HTTP (Trino REST)     │ HTTP + Arrow IPC
+                                │ HTTP (Trino REST)     │ HTTP + JSON
                       ┌─────────▼────────┐    ┌─────────▼───────────────────┐
                       │ Trino 484        │    │ dfrunner (Rust)             │
                       │ official image   │    │ single | coordinator+worker │
@@ -49,13 +49,13 @@
 |---|---|---|
 | `m0` CLI (`m0/`) | Python 3.12, managed with `uv` | Single entry point for humans and the agent (see the next section) |
 | Plan expander | Python | Turns `plans/*.yaml` into a deterministic run matrix: engine × suite × query × iteration × memory level × concurrency, with an ABBA engine order and a seeded shuffle |
-| Engine adapters | Python | `trino`: the `trino` client package over HTTP, query stats from `/v1/query/{id}`. `df` / `dfd`: HTTP to `dfrunner`, results returned as Arrow IPC. One interface (`m0/engines/base.py`): `start`, `restart`, `health`, `execute`, `cancel`, `stats`, `metrics`, `pool_limit_bytes`, `config_files`, `describe`, `stop`. |
+| Engine adapters | Python | `trino`: the `trino` client package over HTTP, query stats from `/v1/query/{id}`. `df` / `dfd`: HTTP to `dfrunner`, results returned as JSON. One interface (`m0/engines/base.py`): `start`, `restart`, `health`, `execute`, `cancel`, `stats`, `metrics`, `pool_limit_bytes`, `config_files`, `describe`, `stop`. |
 | `dfrunner` | Rust | Adapted from datafusion-distributed's `benchmarks/remote-worker`. Modes: `single` (plain DataFusion, step 3b) and `node` (worker plus HTTP coordinator endpoint, step 5). Adds: Iceberg REST catalog registration via iceberg-rust (Glue in Phase C), memory-pool limit and high-water mark, disabled disk manager, operator metrics, structured errors. Under 1,000 lines. API: [below](#dfrunner-api). |
 | Environment | Bash + Docker Compose (local), Bash + AWS CLI (AWS) | `infra/local/compose.yaml`, `infra/aws/*.sh`, wrapped by `m0 env …` |
 | Data generator | SQL + Python | `datagen/*.sql`, run through Trino: CTAS from the `tpch`/`tpcds` connectors, then the `etl.*` derived tables |
 | Metrics sampler | Python | Reads cgroup v2 files of the engine and `objstore` containers without root: `cpu.stat` deltas, `memory.current` sampled at 20 Hz, lifetime `memory.peak`, `memory.events` `oom_kill`. See [Peak memory](#peak-memory). |
 | Classifier | Python | Applies the outcome rules from methodology section 7. Error-pattern table in `m0/classify_rules.yaml`, unit-tested. |
-| Differ | Python + pyarrow | Normalises results and compares them to the reference (methodology section 8). Stores fingerprints, and diffs only when they differ. |
+| Differ | Python | Normalises results and compares them to the reference (methodology section 8). Stores fingerprints, and diffs only when they differ. |
 | Stats and report | Python + matplotlib | Medians, geomeans, bootstrap CIs, charts, Markdown report from `docs/report-template.md` |
 | Skill | Markdown | `.claude/skills/m0-bench/SKILL.md` plus runbooks; explains the harness and how to analyse results |
 
@@ -80,6 +80,7 @@ Rules every command follows:
 | `m0 data verify --engine E [--suite S] [--sf N]` | Fingerprints every table through engine E (row count; per column non-null count, min, max, sum or sum of lengths) into `results/verify/<E>/`, and compares with Trino's fingerprints: can E read everything Trino wrote, with the same values? |
 | `m0 run <plan.yaml> [--engine E] [--query Q] [--resume] [--run-id ID]` | Executes the plan's cells (or those matching `--engine`/`--query`, both repeatable) into `results/<run-id>/`. Prints only non-`ok` cells and restarts as they happen, then outcome counts per engine. An existing run ID needs `--resume` (exit code 4 otherwise, also if the plan file changed); `--resume` without `--run-id` continues the latest run of that plan. |
 | `m0 status [<run-id>\|latest]` | Progress, outcome counts, and the last failure in one line |
+| `m0 results list\|prune [--keep ID] [--yes]` | Lists runs under `results/`; `prune` deletes runs not named in `results/keep.txt` or `--keep` (dry run without `--yes`). See [Results](#results). |
 | `m0 summarize <run-id\|latest>` | Outcome counts per engine, suite totals and ratios, top 10 slowest relative queries, every non-`ok` cell with a one-line reason |
 | `m0 compare <run-a> <run-b>` | Before/after comparison, e.g. a new upstream version or `dfd-jo` vs `dfd` |
 | `m0 explain <run-id> <engine> <query>` | Saves plans and A5 breakdown; prints the top operators by time |
@@ -223,7 +224,7 @@ Strict parts grow from real failures instead of being designed up front.
   files.
 - **A file map in `SKILL.md`** shows where every log, plan and metric lives for a given
   cell, so the agent can grep the right file instead of listing directories.
-- **Query results, don't print them.** Read result tables with DuckDB or pyarrow queries,
+- **Query results, don't print them.** Read `cells.jsonl` and `answers.jsonl` with a short Python or DuckDB query,
   and read logs with `grep`, `tail` or `m0 logs --grep`, rather than whole files.
 - **Noise rules** in `analyse.md`, so the agent doesn't chase variance:
   - Trust suite totals over single S3-backed queries, which can vary by ±50%.
@@ -265,7 +266,7 @@ acceptance criteria and risks per step: [implementation-plan.md](implementation-
 ```text
 m0-bench/
 ├── README.md  LICENSE  NOTICE
-├── pyproject.toml  uv.lock          # Python deps: trino, pyarrow, pyyaml, httpx, matplotlib
+├── pyproject.toml  uv.lock          # Python deps: trino, pyyaml (matplotlib with the report)
 ├── versions.lock.yaml               # Trino image digest, DataFusion/datafusion-distributed/iceberg-rust revs, Lakekeeper, SeaweedFS, JDK
 ├── m0/                              # Python package: cli, plan, queries, engines/, metrics, classify (+ classify_rules.yaml), runner, store, diff, stats, report
 ├── dfrunner/                        # Rust crate: Cargo.toml, Cargo.lock, src/
@@ -296,7 +297,7 @@ is the container health check.
 |---|---|
 | `GET /health` | 200 once the catalog is connected (startup waits up to 60 s for it) |
 | `GET /status` | Versions compiled in (DataFusion, datafusion-distributed, iceberg-rust, datafusion-iceberg; from `Cargo.lock`), settings (file, applied session options, `target_partitions`, pool kind and limit, disk manager, catalog), pool `limit`/`reserved`/`peak`, namespaces (re-listed), running query IDs |
-| `POST /query` `{"sql", "query_id"}` | Plans and executes read-only SQL (DDL, DML and `SET` rejected), collects every batch, returns 200 with an Arrow IPC stream plus `x-dfrunner-{query-id,elapsed-ms,pool-peak-bytes,rows}` headers. On failure: 422 `{"query_id", "error": {variant, contexts, root_message, message}}`, where `variant` is the root `DataFusionError` variant (`ResourcesExhausted`, `NotImplemented`, `Plan`, `SQL`, `Execution`, …, or `Cancelled`) and `contexts` the context labels on the way (e.g. `IcebergError(FeatureUnsupported)`). 409 if the ID is already running. |
+| `POST /query` `{"sql", "query_id"}` | Plans and executes read-only SQL (DDL, DML and `SET` rejected), collects every batch, returns 200 with `{"columns": [{name, type}], "rows": [[…]]}` (canonical JSON values, see [Results](#results)) plus `x-dfrunner-{query-id,elapsed-ms,pool-peak-bytes,rows}` headers. On failure: 422 `{"query_id", "error": {variant, contexts, root_message, message}}`, where `variant` is the root `DataFusionError` variant (`ResourcesExhausted`, `NotImplemented`, `Plan`, `SQL`, `Execution`, …, or `Cancelled`) and `contexts` the context labels on the way (e.g. `IcebergError(FeatureUnsupported)`). 409 if the ID is already running. |
 | `GET /queries/{id}` | Final stats of one of the last 512 queries: `elapsed_ms`, `planning_ms`, `execution_ms`, `process_cpu_s` (getrusage delta), `rows`, `pool {limit, at_start, peak, at_end}`, `error`, and `metrics {operators: [{depth, op, metrics}], plan}` (physical plan with metrics). 202 while running. |
 | `DELETE /queries/{id}` | Cancel: aborts the query's task. A client that disconnects also aborts it. |
 
@@ -313,11 +314,11 @@ is the container health check.
   resolves, so namespaces created later work); tables are datafusion-distributed's
   `IcebergCatalogTableProvider`, cached per table for the schema, with metadata
   reloaded on every scan.
-- **Results Parquet** (`rows/<cell_id>.parquet`) keeps the Arrow types DataFusion
-  returns, with layout variants collapsed (`m0/store.py` `comparable_type`: string
-  views and large strings → `string`, dictionaries decoded). Trino rows are converted
-  from Trino type names to the same Arrow types, so the step 4 differ compares like
-  with like; `engine_types` in the Parquet metadata keeps each engine's own names.
+- **JSON results:** dfrunner encodes values with the same canonical rules the Trino
+  adapter applies to the trino client's Python values (`dfrunner/src/query.rs`
+  `to_json`, `m0/engines/base.py` `canonical`; table in [Results](#results)), so the
+  two engines' answers compare as JSON. Column types are each engine's own names
+  (Arrow type names here).
 
 ## Run plans
 
@@ -335,7 +336,8 @@ mem_levels: [100]        # % of the baseline memory budget (B2, step 5)
 iterations: 3            # hot runs after each query's first run (iteration 0)
 cold: per_block          # per_query | per_block
 timeout_s: 600
-result_rows_cap: 100000  # result rows kept per iteration-0 cell
+result_rows_cap: 100000  # result rows kept per answer (answers.jsonl)
+diag: false              # true, or queries [tpch/q01]: write diag/<cell_id>/ for those cells
 queries:
   - {suite: tpch, ids: [q01, q03]}
   - {suite: etl, ids: [X1_mem], iterations: 0, expect: err_mem, timeout_s: 120}  # per-entry overrides
@@ -369,7 +371,8 @@ harness runs unprivileged, so it uses:
   Always true for the first heavy query after a restart.
 - **Otherwise the maximum of `memory.current` sampled at 20 Hz**
   (`peak_mem_source = sampled`). It can miss spikes shorter than 50 ms, so it's a
-  lower bound. The full timeline is in `cells/<cell_id>/memory.csv`.
+  lower bound. The full timeline is written to `diag/<cell_id>/memory.csv` when the plan
+  asks for diagnostics (`diag`).
 - **Engine-reported peak** alongside (`engine_peak_mem_bytes`: Trino
   `peakTotalMemoryReservation`; DataFusion the pool high-water mark from dfrunner).
 
@@ -386,33 +389,88 @@ Caveats:
 - `memory.current` includes page cache charged to the container. For `objstore` that's
   a large share (reclaimable, so not an OOM risk by itself).
 
-## Results schema
+## Results
 
-`results/<run-id>/runs.parquet` has one row per executed cell (`m0/store.py` `SCHEMA`):
+Every run writes plain JSON to `results/<run-id>/` (`m0/store.py`):
 
-| Group | Columns |
+```text
+results/<run-id>/
+├── run.json       what and how: run ID, plan (file, hash, resolved settings), git SHA
+│                  and dirty flag, versions.lock.yaml (content and hash), image IDs and
+│                  digests, per engine its reported version and key settings plus hashes
+│                  of its config files, container limits, host (CPU, RAM, kernel, Docker,
+│                  cgroup), WSL config, start and end time, one entry per --resume
+├── cells.jsonl    one line per finished cell, appended and fsynced as it finishes
+├── answers.jsonl  result rows of the first completed run per engine × query, capped
+└── diag/<cell_id>/  query.sql, stats.json (engine stats with plan), memory.csv (20 Hz
+                   timeline); only for cells the plan's `diag` selects
+```
+
+- **Planned cells** aren't stored: `m0.plan.expand(run.json["plan"])` gives them again
+  (the expander is deterministic). `--resume` refuses a run whose `plan_hash` (of the
+  resolved plan) differs from the plan file's.
+- **`cells.jsonl`** is the only measurements file. A crash loses at most the running
+  cell, and a torn last line is ignored. Read it with the standard library or DuckDB
+  (`SELECT … FROM read_json_auto('results/<run-id>/cells.jsonl')`).
+- **Retention:** `m0 results list` lists runs; `m0 results prune` deletes every run
+  not named in `results/keep.txt` (run IDs or globs, one per line) or `--keep`, as a
+  dry run unless `--yes`. Runs in progress are never deleted. `results/datagen/` and
+  `results/verify/` hold other artifacts and are never listed or pruned.
+
+### cells.jsonl
+
+One JSON object per cell, every field present (null when unknown), in this order
+(`m0/store.py` `FIELDS`):
+
+| Group | Fields |
 |---|---|
-| Identity | `run_id, cell_id, seq, block, phase, plan, engine, engine_variant, suite, query_id, round, iteration, mem_level, concurrency, client_id` |
-| Cold protocol | `cold` (iteration 0 right after a restart + cache drop), `cold_policy`, `restart_s` (restart before this cell, else null), `cache_dropped` |
-| Time and CPU | `started_at, wall_ms` (harness: execute + fetch all rows), `engine_elapsed_ms, cpu_s` (cgroup `usage_usec` delta), `engine_cpu_s` |
-| Memory | `peak_mem_bytes, peak_mem_source, mem_start_bytes, engine_peak_mem_bytes, mem_limit_bytes, pool_limit_bytes, objstore_peak_mem_bytes, objstore_cpu_s, oom_kills, mem_samples` |
+| Identity | `cell_id, seq, block, round, engine, mem_level, suite, query_id, iteration` |
+| Cold protocol | `cold` (iteration 0 right after a restart + cache drop), `events`: what happened before the cell, e.g. `[{"event": "restart", "reason": "cold run", "s": 13.7}, {"event": "cache_drop", "s": 0.9}]`. Restart reasons: `cold run`, `new block`, `after killed`, `after unresponsive`, `after timeout (engine still busy after cancel)`. |
+| Time | `started_at, wall_ms` (harness: execute + fetch all rows), `cpu_s` (cgroup `usage_usec` delta), `engine_elapsed_ms, engine_cpu_s`, `planning_ms`, and the time breakdown `scan_ms, exchange_ms, compute_ms` |
+| Memory | `peak_mem_bytes, peak_mem_source` (see [Peak memory](#peak-memory)), `engine_peak_mem_bytes, mem_limit_bytes, pool_limit_bytes, objstore_peak_mem_bytes, oom_kills` |
 | Outcome | `outcome, expected_outcome` (plan `expect`), `error_class` (rule id or signal), `error_line, unrecognised, engine_query_id` |
-| Result | `rows, result_stored` (`full`/`truncated`, iteration 0 only), `result_hash, diff_status` (`pending` until the step 4 differ) |
-| Phase C | `nodes, instance_type, spot_usd_per_h` |
+| Result | `rows` (row count), `answer`: `full`/`truncated` on the cell whose rows went to `answers.jsonl`, else null |
+
+Time breakdown: operator time summed over threads (so it can exceed `wall_ms`), from
+the engine's final stats.
+
+| Field | Trino (`/v1/query/{id}` `operatorSummaries`) | DataFusion (dfrunner operator metrics) |
+|---|---|---|
+| `planning_ms` | `planningTime` | `planning_ms` |
+| `scan_ms` | wall time (addInput + getOutput + finish) of `TableScanOperator`, `ScanFilterAndProjectOperator`; includes waiting for S3 reads | scan timer of a scan operator, if it has one. The Iceberg `DataSourceExec` has none, so null for now. |
+| `exchange_ms` | wall time of exchange, merge and output operators (`ExchangeOperator`, `LocalExchange*`, `MergeOperator`, `LocalMergeSourceOperator`, `PartitionedOutputOperator`, `TaskOutputOperator`) | `elapsed_compute + repartition_time + send_time` of `RepartitionExec`, `CoalescePartitionsExec`, `SortPreservingMergeExec` (and shuffle operators in step 5) |
+| `compute_ms` | wall time of every other operator | `elapsed_compute` of every other operator |
+
+The two engines measure differently (Trino operator wall time includes blocking reads
+inside an operator, DataFusion `elapsed_compute` excludes async waits), so compare each
+bucket within an engine, and across engines only as a rough share.
 
 Until the differ exists, `ok` means "completed"; `ok_mismatch` comes with step 4.
 
-Other files in `results/<run-id>/`: `cells.jsonl` (the same rows, appended per cell;
-`runs.parquet` is rebuilt from it), `plan.yaml`, `cells.json` (the expanded plan),
-`run.log`, `cells/<cell_id>/{query.sql, engine_stats.json, memory.csv}` and
-`rows/<cell_id>.parquet` (result rows of iteration-0 cells, capped at
-`result_rows_cap` rows and 64 MiB).
+### answers.jsonl
 
-`env.json` holds the environment manifest: git SHA and dirty flag, the
-`versions.lock.yaml` content and hash, resolved image IDs and digests, host
-CPU/RAM/kernel/Docker, the WSL config (or EC2 instance metadata), hashes of the engine
-config files, container limits, the plan, start and end times, and one entry per
-`--resume`.
+One line per engine × query: the first cell of that query that completed (usually
+iteration 0 of round 0):
+`{"cell_id", "engine", "suite", "query_id", "columns": [{"name", "type"}], "row_count",
+"truncated", "rows": [[…], …]}`. At most `result_rows_cap` rows and 64 MiB are kept.
+`type` is the engine's own type name (`decimal(38, 2)` on Trino, `Decimal128(38, 2)` on
+DataFusion).
+
+Values use one canonical JSON encoding per type in both engines, so answers compare as
+JSON (`m0/engines/base.py` `canonical`, dfrunner `to_json`):
+
+| Type | Encoding |
+|---|---|
+| NULL | `null` |
+| boolean, integers | JSON boolean, number |
+| real, double | JSON number (REAL by its shortest decimal form); NaN and infinities as `"NaN"`, `"Infinity"`, `"-Infinity"` |
+| decimal | string with the type's scale: `"1.50"` (the differ normalises scales; methodology section 8) |
+| varchar, char | string (char padding as the engine returns it) |
+| date | `"YYYY-MM-DD"` |
+| timestamp | `"YYYY-MM-DDTHH:MM:SS.ffffff"`; with time zone converted to UTC and suffixed `Z` |
+| varbinary | lowercase hex string |
+| array, row | JSON array |
+| anything else | the engine client's string form |
 
 ## Upstream code reuse
 

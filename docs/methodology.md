@@ -44,7 +44,7 @@ used as evidence. Its known weaknesses are summarised in the report.
   - **build:** `dfrunner` is a release build with thin LTO and the mimalloc allocator,
     as in datafusion-distributed's own benchmarks. Trino runs from its official image.
     The allocator affects memory behaviour (RSS outside the pool), so it is part of
-    what is measured, and is recorded in `env.json`.
+    what is measured, and is recorded in each run's `run.json`.
 - Both engines get Iceberg tables through the same REST catalog and S3 credentials.
   `df` uses datafusion-distributed's catalog-backed Iceberg table provider (the one
   `dfd` uses), which reloads table metadata on every scan.
