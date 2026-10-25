@@ -1,0 +1,39 @@
+[package]
+name = "dfrunner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+description = "DataFusion query server for the iceberg-etl-bench harness (modes: single; node in step 5)"
+publish = false
+
+# Engine libraries are pinned to exact revisions (versions.lock.yaml records them):
+# - datafusion-distributed + datafusion-distributed-iceberg: main@ee3eacd (crate version 4.0.0).
+#   The v4.0.0 tag has no Iceberg crate; ee3eacd is the main commit whose lockfile pins
+#   the DataFusion / iceberg-rust / datafusion-iceberg revisions below.
+# - DataFusion 55.0.0 (Cargo.lock started from datafusion-distributed's lockfile).
+# - iceberg-rust 5b82ab99 and apache/datafusion-iceberg 20327db (via the iceberg crate).
+[dependencies]
+datafusion = { version = "=55.0.0" }
+datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "ee3eacd93af66e4ef2e2e72a253842c723f92ca5" }
+datafusion-distributed-iceberg = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "ee3eacd93af66e4ef2e2e72a253842c723f92ca5" }
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3", default-features = false, features = ["opendal-s3"] }
+async-trait = "0.1.89"
+axum = "0.8"
+env_logger = "0.11.8"
+futures = "0.3.31"
+libc = "0.2"
+log = "0.4.27"
+mimalloc = "0.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.48", features = ["full"] }
+
+[profile.release]
+# Build choice and measured cost: see the "Build" notes in configs/datafusion/local/dfrunner.properties.
+lto = "thin"
+codegen-units = 16
+debug = false
+strip = "debuginfo"

@@ -18,7 +18,7 @@ from m0 import engines, env_local, runenv
 from m0 import plan as plan_mod
 from m0.classify import Signals, classify
 from m0.metrics import Cgroup, Sampler, cgroup_dir
-from m0.queries import load_manifest, render
+from m0.queries import load_manifest, render_for
 from m0.store import RunStore, list_runs, now
 
 RESTART_AFTER = ("killed", "unresponsive")
@@ -136,14 +136,23 @@ class Runner:
         self.store.write_json("env.json", env)
 
     def check_namespaces(self, todo: list[plan_mod.Cell]) -> None:
-        if "trino" not in self.adapters:
-            return
+        """Every namespace the cells need exists in the Iceberg catalog (engine-neutral)."""
         needed = sorted({f"{ns}_sf{self.plan['sf']}" for c in todo
                          for ns in self.manifest[f"{c.suite}/{c.query_id}"].namespaces})
-        res = self.adapters["trino"].execute("SHOW SCHEMAS FROM iceberg", timeout_s=60)
-        have = {r[0] for r in res.rows or []}
+        try:
+            have = env_local.namespaces()
+        except Exception as e:  # catalog.CatalogError, connection errors
+            raise RunPrerequisite(f"cannot list namespaces from the Iceberg catalog: {e}") from e
         if missing := [n for n in needed if n not in have]:
             raise RunPrerequisite(f"missing namespaces {missing}; run `m0 data gen` for them")
+
+    def record_engine_info(self, eng) -> None:
+        """Engine-reported versions and settings into env.json, once per engine and run."""
+        env = self.store.read_json("env.json")
+        info = env.setdefault("engine_info", {})
+        if env and (not info.get(eng.name) or "error" in info.get(eng.name, {})):
+            info[eng.name] = eng.describe()
+            self.store.write_json("env.json", env)
 
     # ---- execution ----
     def run(self) -> RunResult:
@@ -159,8 +168,8 @@ class Runner:
                   f"{' (resume)' if self.resume else ''}")
             self.emit("start", {"run_id": s.run_id, "todo": len(todo), "planned": len(self.cells), "dir": str(s.dir)})
             if todo:
-                self.adapters[todo[0].engine].start()
                 self.check_namespaces(todo)
+                self.adapters[todo[0].engine].start()
             prev_block, restart_reason = None, None
             for cell in todo:
                 eng = self.adapters[cell.engine]
@@ -172,6 +181,7 @@ class Runner:
                     why = f"after {restart_reason}" if restart_reason else "cold run" if cold else "new block"
                     restart_s = eng.restart()
                     s.log(f"restart {eng.name} before {cell.cell_id} ({why}): {restart_s:.1f}s")
+                    self.record_engine_info(eng)
                     if restart_reason:
                         self.emit("event", f"restarted {eng.name} after {restart_reason} ({restart_s:.0f}s)")
                     if cold:
@@ -187,6 +197,11 @@ class Runner:
                     self.emit("cell", row)
                 if row["outcome"] in RESTART_AFTER:
                     restart_reason = row["outcome"]
+                elif row["outcome"] == "timeout" and eng.busy():
+                    # The cancelled query still holds CPU or memory (e.g. a DataFusion
+                    # operator in a long loop without an await point): don't measure the
+                    # next cells on a busy engine.
+                    restart_reason = "timeout (engine still busy after cancel)"
         except KeyboardInterrupt:
             interrupted = True
             s.log("interrupted")
@@ -204,7 +219,7 @@ class Runner:
     def execute_cell(self, cell: plan_mod.Cell, eng, restart_s: float | None, dropped: bool) -> dict:
         s, plan = self.store, self.plan
         q = self.manifest[f"{cell.suite}/{cell.query_id}"]
-        sql = render(q, plan["sf"])
+        sql = render_for(q, plan["sf"], cell.engine)
         cdir = s.cell_dir(cell.cell_id)
         (cdir / "query.sql").write_text(sql + "\n")
         eng_state = env_local.container_state(eng.service)
@@ -213,7 +228,7 @@ class Runner:
                            "objstore": Cgroup(cgroup_dir(obj_state["id"]) if obj_state.get("id") else None)})
         started_at = now()
         sampler.start()
-        res = eng.execute(sql, timeout_s=float(plan["timeout_s"]))
+        res = eng.execute(sql, timeout_s=cell.timeout_s or float(plan["timeout_s"]))
         m = sampler.stop()
         sampler.write_timeline(cdir / "memory.csv")
 
@@ -231,8 +246,9 @@ class Runner:
             healthy_after=healthy))
 
         result_stored = None
-        if cell.iteration == 0 and res.rows is not None:
-            result_stored = s.write_result(cell.cell_id, res.columns, res.rows, int(plan["result_rows_cap"]))
+        if cell.iteration == 0 and res.completed:
+            result_stored = s.write_result(cell.cell_id, res.columns, res.rows, int(plan["result_rows_cap"]),
+                                           table=res.table)
         row = {
             "run_id": s.run_id, "cell_id": cell.cell_id, "seq": cell.seq, "block": cell.block,
             "phase": plan["phase"], "plan": plan["name"], "engine": cell.engine, "engine_variant": "baseline",
@@ -247,7 +263,7 @@ class Runner:
             "oom_kills": m["engine"].oom_kills, "mem_samples": m["engine"].samples,
             "outcome": cls.outcome, "expected_outcome": cell.expect, "error_class": cls.error_class,
             "error_line": cls.error_line, "unrecognised": cls.unrecognised,
-            "engine_query_id": res.engine_query_id, "rows": len(res.rows) if res.rows is not None else None,
+            "engine_query_id": res.engine_query_id, "rows": res.row_count,
             "result_stored": result_stored, "result_hash": None, "diff_status": "pending",
             "nodes": 1, "instance_type": None, "spot_usd_per_h": None,
         }

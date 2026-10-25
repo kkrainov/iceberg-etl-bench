@@ -49,8 +49,8 @@
 |---|---|---|
 | `m0` CLI (`m0/`) | Python 3.12, managed with `uv` | Single entry point for humans and the agent (see the next section) |
 | Plan expander | Python | Turns `plans/*.yaml` into a deterministic run matrix: engine × suite × query × iteration × memory level × concurrency, with an ABBA engine order and a seeded shuffle |
-| Engine adapters | Python | `trino`: the `trino` client package over HTTP, query stats from `/v1/query/{id}`. `df` / `dfd`: HTTP to `dfrunner`, results returned as Arrow IPC. One interface: `start`, `health`, `execute`, `cancel`, `stats`, `stop`. |
-| `dfrunner` | Rust | Adapted from datafusion-distributed's `benchmarks/remote-worker` (~400 lines). Modes: `single` (plain DataFusion) and `node` (worker plus HTTP coordinator endpoint). Adds: Iceberg catalog registration (REST or Glue via iceberg-rust), memory-pool limit and peak tracking, task-metrics export for A5, structured errors. Target size: under 1,000 lines. |
+| Engine adapters | Python | `trino`: the `trino` client package over HTTP, query stats from `/v1/query/{id}`. `df` / `dfd`: HTTP to `dfrunner`, results returned as Arrow IPC. One interface (`m0/engines/base.py`): `start`, `restart`, `health`, `execute`, `cancel`, `stats`, `metrics`, `pool_limit_bytes`, `config_files`, `describe`, `stop`. |
+| `dfrunner` | Rust | Adapted from datafusion-distributed's `benchmarks/remote-worker`. Modes: `single` (plain DataFusion, step 3b) and `node` (worker plus HTTP coordinator endpoint, step 5). Adds: Iceberg REST catalog registration via iceberg-rust (Glue in Phase C), memory-pool limit and high-water mark, disabled disk manager, operator metrics, structured errors. Under 1,000 lines. API: [below](#dfrunner-api). |
 | Environment | Bash + Docker Compose (local), Bash + AWS CLI (AWS) | `infra/local/compose.yaml`, `infra/aws/*.sh`, wrapped by `m0 env …` |
 | Data generator | SQL + Python | `datagen/*.sql`, run through Trino: CTAS from the `tpch`/`tpcds` connectors, then the `etl.*` derived tables |
 | Metrics sampler | Python | Reads cgroup v2 files of the engine and `objstore` containers without root: `cpu.stat` deltas, `memory.current` sampled at 20 Hz, lifetime `memory.peak`, `memory.events` `oom_kill`. See [Peak memory](#peak-memory). |
@@ -77,6 +77,7 @@ Rules every command follows:
 | `m0 doctor` | Checks tools, versions, Docker, cgroup v2, WSL settings, disk, AWS credentials (Phase C) |
 | `m0 env up/down/status [--target local\|aws]` | Starts and stops the stack. `down` on AWS also verifies that nothing tagged is left running. |
 | `m0 data gen --suite tpch\|tpcds\|etl --sf N` | Generates and validates the tables (row counts per table against expected values) |
+| `m0 data verify --engine E [--suite S] [--sf N]` | Fingerprints every table through engine E (row count; per column non-null count, min, max, sum or sum of lengths) into `results/verify/<E>/`, and compares with Trino's fingerprints: can E read everything Trino wrote, with the same values? |
 | `m0 run <plan.yaml> [--engine E] [--query Q] [--resume] [--run-id ID]` | Executes the plan's cells (or those matching `--engine`/`--query`, both repeatable) into `results/<run-id>/`. Prints only non-`ok` cells and restarts as they happen, then outcome counts per engine. An existing run ID needs `--resume` (exit code 4 otherwise, also if the plan file changed); `--resume` without `--run-id` continues the latest run of that plan. |
 | `m0 status [<run-id>\|latest]` | Progress, outcome counts, and the last failure in one line |
 | `m0 summarize <run-id\|latest>` | Outcome counts per engine, suite totals and ratios, top 10 slowest relative queries, every non-`ok` cell with a one-line reason |
@@ -283,6 +284,41 @@ m0-bench/
 └── results/                         # git-ignored
 ```
 
+## dfrunner API
+
+`dfrunner/` (Rust, ~700 lines) serves one long-lived `SessionContext` over HTTP on
+`127.0.0.1:9000`. Configuration: `configs/datafusion/local/dfrunner.properties`
+(`dfrunner.*`, `catalog.*`, `s3.*`, and any `datafusion.*`/`iceberg.*` session option,
+each with its reason), S3 credentials from `AWS_*` variables. `dfrunner healthcheck`
+is the container health check.
+
+| Endpoint | Does |
+|---|---|
+| `GET /health` | 200 once the catalog is connected (startup waits up to 60 s for it) |
+| `GET /status` | Versions compiled in (DataFusion, datafusion-distributed, iceberg-rust, datafusion-iceberg; from `Cargo.lock`), settings (file, applied session options, `target_partitions`, pool kind and limit, disk manager, catalog), pool `limit`/`reserved`/`peak`, namespaces (re-listed), running query IDs |
+| `POST /query` `{"sql", "query_id"}` | Plans and executes read-only SQL (DDL, DML and `SET` rejected), collects every batch, returns 200 with an Arrow IPC stream plus `x-dfrunner-{query-id,elapsed-ms,pool-peak-bytes,rows}` headers. On failure: 422 `{"query_id", "error": {variant, contexts, root_message, message}}`, where `variant` is the root `DataFusionError` variant (`ResourcesExhausted`, `NotImplemented`, `Plan`, `SQL`, `Execution`, …, or `Cancelled`) and `contexts` the context labels on the way (e.g. `IcebergError(FeatureUnsupported)`). 409 if the ID is already running. |
+| `GET /queries/{id}` | Final stats of one of the last 512 queries: `elapsed_ms`, `planning_ms`, `execution_ms`, `process_cpu_s` (getrusage delta), `rows`, `pool {limit, at_start, peak, at_end}`, `error`, and `metrics {operators: [{depth, op, metrics}], plan}` (physical plan with metrics). 202 while running. |
+| `DELETE /queries/{id}` | Cancel: aborts the query's task. A client that disconnects also aborts it. |
+
+- **Memory:** the pool is DataFusion's own `TrackConsumersPool<GreedyMemoryPool>` (what
+  `with_memory_limit` builds), wrapped by `PeakPool`, which only records `reserved()`
+  after each successful grow. `POST /query` resets the high-water mark, so with one
+  query at a time `pool.peak` is that query's; the adapter records it as
+  `engine_peak_mem_bytes`. Container memory (`peak_mem_bytes`) shows what the pool
+  doesn't track.
+- **Results are buffered** on the server until the query ends, so an error is always a
+  clean 422 rather than a broken stream. Benchmark results are small (aggregates,
+  `LIMIT 100`); the harness clock still covers transfer and decoding.
+- **Tables:** catalog `iceberg` = the REST catalog; schemas = namespaces (any name
+  resolves, so namespaces created later work); tables are datafusion-distributed's
+  `IcebergCatalogTableProvider`, cached per table for the schema, with metadata
+  reloaded on every scan.
+- **Results Parquet** (`rows/<cell_id>.parquet`) keeps the Arrow types DataFusion
+  returns, with layout variants collapsed (`m0/store.py` `comparable_type`: string
+  views and large strings → `string`, dictionaries decoded). Trino rows are converted
+  from Trino type names to the same Arrow types, so the step 4 differ compares like
+  with like; `engine_types` in the Parquet metadata keeps each engine's own names.
+
 ## Run plans
 
 `plans/*.yaml`, expanded by `m0/plan.py` into an ordered cell list. The same plan
@@ -302,7 +338,7 @@ timeout_s: 600
 result_rows_cap: 100000  # result rows kept per iteration-0 cell
 queries:
   - {suite: tpch, ids: [q01, q03]}
-  - {suite: etl, ids: [X1_mem], iterations: 0, expect: err_mem}  # per-entry overrides
+  - {suite: etl, ids: [X1_mem], iterations: 0, expect: err_mem, timeout_s: 120}  # per-entry overrides
 ```
 
 - **Order:** rounds → engine blocks (engines reversed on odd rounds, so two engines
@@ -335,7 +371,7 @@ harness runs unprivileged, so it uses:
   (`peak_mem_source = sampled`). It can miss spikes shorter than 50 ms, so it's a
   lower bound. The full timeline is in `cells/<cell_id>/memory.csv`.
 - **Engine-reported peak** alongside (`engine_peak_mem_bytes`: Trino
-  `peakTotalMemoryReservation`).
+  `peakTotalMemoryReservation`; DataFusion the pool high-water mark from dfrunner).
 
 A privileged sidecar holding the `memory.peak` file descriptor open would give exact
 per-query peaks. It was not built, because the lifetime-peak rule already covers the

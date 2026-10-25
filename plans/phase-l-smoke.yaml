@@ -1,10 +1,11 @@
 # Smoke plan: run after every harness change. SF1, a few queries per suite,
-# one deliberate out-of-memory cell. Format: docs/framework-design.md ("Run plans").
+# one deliberate out-of-memory cell, every engine built so far. Two engines give two
+# rounds in ABBA order (trino, df, df, trino). Format: docs/framework-design.md ("Run plans").
 name: phase-l-smoke
 phase: L
 sf: 1
 seed: 20261024
-engines: [trino]
+engines: [trino, df]
 mem_levels: [100]
 iterations: 3          # hot runs after the first (cold) run of each query
 cold: per_block        # one engine restart + page-cache drop per engine block (fast)
@@ -16,8 +17,13 @@ queries:
     ids: [q03, q07, q55]
   - suite: etl
     ids: [W1, J3]
-  # Deliberate failure: needs more than the 4 GiB per-node query memory.
+  # Deliberate failure: needs more than the 4 GiB per-node query memory (Trino
+  # query.max-memory-per-node = DataFusion pool). err_mem, or killed if the engine's
+  # accounting lets the container hit its limit first.
+  # timeout_s: Trino fails it after ~8 s; DataFusion's array_agg takes far longer than
+  # the 600 s default to reach the limit (step 3b finding), so keep the smoke run short.
   - suite: etl
     ids: [X1_mem]
     iterations: 0
     expect: err_mem
+    timeout_s: 120

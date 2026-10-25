@@ -16,8 +16,10 @@ FAILED = frozenset(OUTCOMES) - {"ok"}
 class EngineError:
     """An error the engine reported for a query."""
 
-    name: str | None = None       # Trino errorCode.name, e.g. EXCEEDED_LOCAL_MEMORY_LIMIT
-    type: str | None = None       # Trino errorType, e.g. INSUFFICIENT_RESOURCES
+    name: str | None = None       # Trino errorCode.name, e.g. EXCEEDED_LOCAL_MEMORY_LIMIT;
+                                  # DataFusion: root DataFusionError variant, e.g. ResourcesExhausted
+    type: str | None = None       # Trino errorType, e.g. INSUFFICIENT_RESOURCES;
+                                  # DataFusion: first error context, e.g. IcebergError(FeatureUnsupported)
     code: int | None = None
     message: str = ""
     exception: str | None = None  # engine-side exception class
@@ -67,7 +69,8 @@ def error_line(err: EngineError) -> str:
 
 def match_rule(engine: str, err: EngineError, rules: dict) -> dict | None:
     for rule in rules["rules"]:
-        if rule.get("engine") not in (None, engine):
+        engines = rule.get("engine")
+        if engines is not None and engine not in ([engines] if isinstance(engines, str) else engines):
             continue
         checks = [("error_name", err.name, re.fullmatch), ("error_type", err.type, re.fullmatch),
                   ("message", err.message, re.search)]

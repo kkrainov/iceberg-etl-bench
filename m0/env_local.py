@@ -15,7 +15,9 @@ from m0 import versions
 from m0.output import FAIL, OK, WARN, Check
 from m0.paths import LOCAL_COMPOSE
 
-ENGINES = ("trino",)
+ENGINES = ("trino", "df")
+DFRUNNER_URL = "http://127.0.0.1:9000"
+BUILD_TIMEOUT_S = 3600
 INFRA_SERVICES = ("objstore", "catalog-db", "catalog-migrate", "catalog")
 
 BUCKET = "m0-bench"
@@ -53,7 +55,8 @@ class EnvError(Exception):
 
 def compose(*args: str, timeout: float = 600, check: bool = True) -> subprocess.CompletedProcess:
     env = {**os.environ, **versions.compose_env(versions.load())}
-    cmd = ["docker", "compose", "-f", str(LOCAL_COMPOSE), "--profile", "trino", *args]
+    profiles = [arg for e in ENGINES for arg in ("--profile", e)]
+    cmd = ["docker", "compose", "-f", str(LOCAL_COMPOSE), *profiles, *args]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     if check and res.returncode != 0:
         raise EnvError(f"docker compose {' '.join(args)} failed:\n{res.stderr.strip()[-2000:]}")
@@ -150,6 +153,36 @@ def trino_smoke(timeout_s: float = 180) -> str:
     raise EnvError(f"Trino smoke test failed: {last_error}")
 
 
+def build_engine(engine: str) -> float:
+    """Build a locally built engine image (dfrunner); incremental thanks to cache mounts."""
+    start = time.monotonic()
+    compose("build", engine, timeout=BUILD_TIMEOUT_S)
+    return time.monotonic() - start
+
+
+def df_smoke(timeout_s: float = 120) -> str:
+    """Read-only end-to-end check: dfrunner -> REST catalog -> object store."""
+    from m0.engines.df import DfEngine
+
+    eng = DfEngine()
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        status = eng.status()
+        if status and isinstance(status.get("namespaces"), list):
+            res = eng.execute("SELECT count(*) FROM iceberg.tpch_sf1.region", timeout_s=60) \
+                if "tpch_sf1" in status["namespaces"] else eng.execute("SELECT 1", timeout_s=60)
+            if res.completed:
+                v = status.get("versions", {})
+                return (f"DataFusion {v.get('datafusion')}, {len(status['namespaces'])} namespaces, "
+                        f"pool {status['pool']['limit'] / 2**30:.0f} GiB; read through catalog ok")
+            last = res.error.message if res.error else res.client_error
+        elif status:
+            last = f"catalog: {status.get('namespaces')}"
+        time.sleep(2)
+    raise EnvError(f"dfrunner smoke test failed: {last}")
+
+
 def services() -> list[dict]:
     res = compose("ps", "--all", "--format", "json", check=False)
     out = []
@@ -171,11 +204,18 @@ def up(engine: str | None, engine_mem: str, engine_cpus: str) -> list[Check]:
         others = [e for e in ENGINES if e != engine]
         if others:
             compose("stop", *others)
+        built = None
+        if engine == "df":
+            # Engines are stopped first: a release build of DataFusion needs several GiB.
+            built = build_engine(engine)
         # Always recreate: picks up config edits and guarantees a cold engine.
         compose("up", "-d", "--wait", "--force-recreate", engine)
     checks = [Check("bucket", OK, ensure_bucket()), Check("catalog", OK, ensure_catalog())]
     if engine == "trino":
         checks.append(Check("trino", OK, trino_smoke()))
+    elif engine == "df":
+        checks.append(Check("df.build", OK, f"image m0-dfrunner:local up to date ({built:.0f}s)"))
+        checks.append(Check("df", OK, df_smoke()))
     return checks + status_checks()
 
 
@@ -234,6 +274,13 @@ def container_state(service: str) -> dict:
             "exit_code": state.get("ExitCode"), "oom_killed": state.get("OOMKilled", False),
             "started_at": state.get("StartedAt"), "mem_limit": host.get("Memory") or None,
             "nano_cpus": host.get("NanoCpus") or None, "image": info.get("Image")}
+
+
+def namespaces() -> set[str]:
+    """Iceberg namespaces in the warehouse, from the REST catalog (engine-neutral)."""
+    from m0 import catalog
+
+    return catalog.namespaces()
 
 
 def restart_engine(engine: str) -> float:

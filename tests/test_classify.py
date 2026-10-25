@@ -78,3 +78,44 @@ def test_client_error_without_engine_error_is_unrecognised():
 def test_rules_are_engine_scoped():
     e = err(FIXTURES["local_mem"])
     assert classify(Signals("df", error=e)).outcome == "err_other"
+
+
+DF_FIXTURES = yaml.safe_load((Path(__file__).parent / "fixtures" / "df_errors.yaml").read_text())["errors"]
+
+
+@pytest.mark.parametrize("name", sorted(DF_FIXTURES))
+@pytest.mark.parametrize("engine", ["df", "dfd"])
+def test_real_datafusion_errors(name, engine):
+    case = DF_FIXTURES[name]
+    c = classify(Signals(engine, error=err(case)))
+    assert c.outcome == case["expect"], (name, c)
+    assert c.unrecognised == case.get("unrecognised", False)
+    assert c.error_line.startswith(case["error_name"] + ": ")
+
+
+def test_datafusion_memory_error_is_err_mem_and_names_the_pool():
+    c = classify(Signals("df", error=err(DF_FIXTURES["resources_exhausted"])))
+    assert (c.outcome, c.error_class) == ("err_mem", "df.memory_limit")
+    assert c.error_line.startswith("ResourcesExhausted: Resources exhausted: Additional allocation failed")
+
+
+def test_datafusion_missing_table_is_not_unsupported():
+    # A Plan error for a missing table must not count as a missing feature.
+    c = classify(Signals("df", error=err(DF_FIXTURES["table"])))
+    assert (c.outcome, c.error_class) == ("err_other", "df.missing_object")
+
+
+def test_iceberg_feature_unsupported_context():
+    e = EngineError("Execution", "IcebergError(FeatureUnsupported)", 422,
+                    "IcebergError(FeatureUnsupported)\ncaused by\nExecution error: FeatureUnsupported => x")
+    assert classify(Signals("df", error=e)).outcome == "err_unsupported"
+
+
+def test_df_rules_do_not_apply_to_trino():
+    assert classify(Signals("trino", error=err(DF_FIXTURES["resources_exhausted"]))).outcome == "err_other"
+
+
+def test_df_container_kill_is_killed():
+    c = classify(Signals("df", client_error="ConnectionResetError: reset", container_running=False,
+                         container_exit_code=137, healthy_after=False))
+    assert (c.outcome, c.error_class) == ("killed", "oom_killer")

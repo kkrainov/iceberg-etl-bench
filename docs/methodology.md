@@ -22,15 +22,32 @@ used as evidence. Its known weaknesses are summarised in the report.
 | ID | System | Version (pinned in `versions.lock.yaml`) | Mode |
 |---|---|---|---|
 | `trino` | Trino | 484 (official image) | `retry-policy=NONE`. Phase L: single node. Phase C: dedicated coordinator + workers. |
-| `df` | DataFusion, single process | 55.x via datafusion-distributed's lockfile | One process, no distribution layer |
-| `dfd` | DataFusion + datafusion-distributed | 4.0.0 | Coordinator + N workers over Arrow Flight; any node can coordinate |
+| `df` | DataFusion, single process | 55.0.0 via datafusion-distributed's lockfile | One process (`dfrunner single`), no distribution layer |
+| `dfd` | DataFusion + datafusion-distributed | 4.0.0 (main@ee3eacd: the v4.0.0 tag has no Iceberg crate) | Coordinator + N workers over Arrow Flight; any node can coordinate |
 | `dfd-jo` | `dfd` with apache/datafusion#24456 (join-order enumeration) applied | Commit pinned | Suite A6 only; clearly labelled as unreleased code |
 
 **Configuration rules**
 - Trino is configured per its official documentation (JVM, memory, exchange,
   Iceberg connector). Every non-default setting is listed with a reason.
-- DataFusion uses defaults except the memory pool and parallelism, which are set to
-  match the hardware.
+- DataFusion uses defaults except the memory pool, spilling and parallelism, which are
+  set to match the hardware and Trino. Every value and its reason is in
+  `configs/datafusion/local/dfrunner.properties`:
+  - memory pool limit = Trino's `query.max-memory-per-node` (see memory parity below);
+    the pool is the one DataFusion builds for a memory limit
+    (`TrackConsumersPool<GreedyMemoryPool>`);
+  - `target_partitions` = the container CPU limit;
+  - **no spilling:** DataFusion's disk manager is disabled, so an operator that would
+    spill fails with `ResourcesExhausted` (`err_mem`). Reasons: Trino's default has
+    spilling disabled, this benchmark measures in-memory execution only, and Rino v1
+    targets diskless nodes. Spilling, if measured later, is a named variant for both
+    engines.
+  - **build:** `dfrunner` is a release build with thin LTO and the mimalloc allocator,
+    as in datafusion-distributed's own benchmarks. Trino runs from its official image.
+    The allocator affects memory behaviour (RSS outside the pool), so it is part of
+    what is measured, and is recorded in `env.json`.
+- Both engines get Iceberg tables through the same REST catalog and S3 credentials.
+  `df` uses datafusion-distributed's catalog-backed Iceberg table provider (the one
+  `dfd` uses), which reloads table metadata on every scan.
 - Configurations will be offered to Trino and DataFusion maintainers for review
   before Phase C.
 
@@ -72,10 +89,13 @@ Findings from building the data generator (Trino 484):
 - `etl` skew: power-law key with exponent 1.2; the top key holds about 14% of rows at
   every SF.
 
-Open item: whether iceberg-rust reads every type and encoding Trino writes (step 3b).
-Trino writes Parquet with INT32/INT64 decimals, `timestamp(6)` as INT64 micros, some
-strings as `DELTA_LENGTH_BYTE_ARRAY`, and ~128 MiB row groups (about 16 per SF10
-`lineitem`).
+Engine compatibility (step 3b, `m0 data verify`): iceberg-rust (via
+datafusion-distributed's Iceberg provider) reads every table Trino writes. Trino writes
+Parquet with INT32/INT64 decimals, `timestamp(6)` as INT64 micros, some strings as
+`DELTA_LENGTH_BYTE_ARRAY`, and ~128 MiB row groups (about 16 per SF10 `lineitem`). On
+all 68 tables and 1,072 columns of tpch/tpcds/etl at SF1 and SF10, `df` returns the
+same row counts and, per column, the same non-null count, min, max and sum (or sum of
+string lengths) as Trino. No type is unreadable.
 
 ## 4. Suites
 

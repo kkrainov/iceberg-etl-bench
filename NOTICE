@@ -3,8 +3,22 @@ Copyright 2026 The iceberg-etl-bench authors
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-Code will be adapted from the following Apache-2.0 projects. Each adapted file
-will be listed here with its source path and commit when it is added:
+Code is adapted from the following Apache-2.0 projects. Each adapted file is
+listed with its source path and commit; the file itself carries a
+"Derived from <repo>@<sha>:<path>" line.
+
+Adapted files:
+- dfrunner/src/main.rs
+  Derived from datafusion-contrib/datafusion-distributed@ee3eacd93af66e4ef2e2e72a253842c723f92ca5:benchmarks/remote-worker/src/main.rs
+  (HTTP query endpoint, shared SessionContext with the Iceberg integration,
+  abort-on-drop query task, mimalloc allocator)
+
+Libraries used by dfrunner (dependencies, not copied code): Apache DataFusion,
+datafusion-distributed and datafusion-distributed-iceberg, Apache Iceberg Rust
+(iceberg, iceberg-catalog-rest, iceberg-storage-opendal), apache/datafusion-iceberg.
+Exact revisions: versions.lock.yaml and dfrunner/Cargo.lock.
+
+Sources:
 
 - datafusion-contrib/datafusion-distributed (https://github.com/datafusion-contrib/datafusion-distributed)
 - apache/datafusion (https://github.com/apache/datafusion)

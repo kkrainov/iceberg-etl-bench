@@ -6,20 +6,45 @@ on the same code path for every engine (methodology section 6).
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from m0.classify import EngineError
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 @dataclass
 class ExecResult:
+    """One query execution. A result is either `rows` (Trino: Python values plus engine
+    type names in `columns`) or `table` (DataFusion: the Arrow table as returned)."""
+
     wall_ms: float | None               # execute + fetch all rows, harness clock
     columns: list[tuple[str, str]] = field(default_factory=list)  # (name, engine type)
     rows: list[list] | None = None      # None when the query failed
+    table: "pa.Table | None" = None     # Arrow result (engines that return Arrow)
     engine_query_id: str | None = None
     error: EngineError | None = None    # error reported by the engine
     client_error: str | None = None     # harness-side failure (connection lost, ...)
     timed_out: bool = False
     cancelled: bool = False
+
+    @property
+    def completed(self) -> bool:
+        return self.rows is not None or self.table is not None
+
+    @property
+    def row_count(self) -> int | None:
+        if self.table is not None:
+            return self.table.num_rows
+        return len(self.rows) if self.rows is not None else None
+
+    def as_rows(self) -> list[list] | None:
+        """Result as a list of rows of Python values (both kinds of result)."""
+        if self.table is None:
+            return self.rows
+        cols = [c.to_pylist() for c in self.table.columns]
+        return [list(r) for r in zip(*cols, strict=True)] if cols else [[] for _ in range(self.table.num_rows)]
 
 
 class Engine(ABC):
@@ -65,3 +90,11 @@ class Engine(ABC):
     @abstractmethod
     def stop(self) -> None:
         """Stop the engine."""
+
+    def busy(self) -> bool:
+        """True if the engine still works on or holds memory for a finished/cancelled query."""
+        return False
+
+    def describe(self) -> dict:
+        """Engine-reported version and configuration, for env.json (best effort)."""
+        return {}

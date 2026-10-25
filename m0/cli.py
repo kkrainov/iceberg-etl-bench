@@ -15,6 +15,7 @@ from m0 import datagen, doctor, env_local
 from m0.output import (
     FAIL,
     OK,
+    WARN,
     Check,
     Exit,
     checks_exit,
@@ -54,6 +55,8 @@ def cmd_data(args: argparse.Namespace) -> Exit:
         expected = datagen.load_expected()
         if args.action == "gen":
             return data_gen(args, expected)
+        if args.action == "verify":
+            return data_verify(args, expected)
         return data_status(args, expected)
     except datagen.Prerequisite as e:
         print_checks([Check(f"data.{args.action}", FAIL, str(e))], args.json)
@@ -132,6 +135,70 @@ def data_status(args: argparse.Namespace, expected: dict) -> Exit:
     else:
         print_checks(shown, False)
     return checks_exit(checks)
+
+
+def data_verify(args: argparse.Namespace, expected: dict) -> Exit:
+    from m0 import catalog, engines, verify
+
+    if args.engine is None:
+        raise datagen.Prerequisite("`m0 data verify` needs --engine (trino or df)")
+    against = args.against or ("trino" if args.engine != "trino" else None)
+    suites = [args.suite] if args.suite else list(datagen.SUITES)
+    sfs = [args.sf] if args.sf is not None else datagen.scale_factors(expected)
+    try:
+        present = catalog.namespaces()
+    except catalog.CatalogError as e:
+        raise datagen.Prerequisite(f"catalog not reachable ({e}); start the stack with `m0 env up`") from e
+    namespaces = [datagen.namespace(s, sf) for s in suites for sf in sfs if datagen.namespace(s, sf) in present]
+    if not namespaces:
+        raise datagen.Prerequisite("no generated namespaces match --suite/--sf; run `m0 data gen` first")
+    eng = engines.get(args.engine)
+    if not eng.health():
+        raise datagen.Prerequisite(f"{args.engine} is not running or not healthy; `m0 env up --engine {args.engine}`")
+    checks, report, shown = [], {}, 0
+    start = time.monotonic()
+    for ns in namespaces:
+        got = verify.collect(eng, ns)
+        errors = [t for t, v in got["tables"].items() if v["error"]]
+        line = f"{len(got['tables'])} tables fingerprinted on {args.engine}"
+        if errors:
+            line += f", {len(errors)} failed as a whole: {', '.join(errors)}"
+        ref = verify.load(against, ns) if against else None
+        if against and ref is None:
+            checks.append(Check(ns, WARN, f"{line}; no {against} fingerprints yet "
+                                          f"(run `m0 data verify --engine {against}`)"))
+            continue
+        if ref is None:
+            checks.append(Check(ns, FAIL if errors else OK, line))
+            continue
+        cmp = verify.compare(ref, got)
+        report[ns] = asdict(cmp)
+        status = OK if not cmp.differences and not cmp.missing_reference else FAIL
+        checks.append(Check(ns, status, f"vs {against}: tables {cmp.tables_match}/{cmp.tables} match, columns "
+                                        f"{cmp.columns_match}/{cmp.columns} match, {len(cmp.differences)} differences"))
+        for d in cmp.differences:
+            if shown >= 25:
+                break
+            shown += 1
+            what = f"{d['table']}.{d['column']}" if d.get("column") else d["table"]
+            detail = d.get("error") or f"{d['stat']}: {against} {d['ref']!r} vs {args.engine} {d['got']!r}"
+            checks.append(Check(f"  {what}", FAIL, f"[{d['kind']}] {detail}"[:220]))
+    report_path = None
+    if report:
+        report_path = verify.VERIFY_DIR / args.engine / f"vs-{against}.json"
+        report_path.write_text(json.dumps(report, indent=1, default=str))
+    elapsed = time.monotonic() - start
+    extra = {"engine": args.engine, "against": against, "seconds": round(elapsed, 1),
+             "report": str(report_path) if report_path else None, "comparisons": report}
+    if args.json:
+        print_checks(checks, True, extra)
+    else:
+        print_checks(checks, False)
+        print(f"fingerprints {verify.VERIFY_DIR / args.engine}; "
+              f"{'report ' + str(report_path) if report_path else 'no comparison'} ({elapsed:.0f}s)")
+    if any(c.status == FAIL for c in checks):
+        return Exit.QUERIES_FAILED
+    return Exit.OK
 
 
 def counts_line(counts: dict) -> str:
@@ -222,6 +289,12 @@ def cmd_status(args: argparse.Namespace) -> Exit:
     return Exit.OK
 
 
+def engines_available() -> tuple[str, ...]:
+    from m0 import engines
+
+    return engines.available()
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable output")
@@ -242,10 +315,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_env)
 
     p = sub.add_parser("data", parents=[common], help="generate and validate the Iceberg benchmark tables")
-    p.add_argument("action", choices=["gen", "status"])
+    p.add_argument("action", choices=["gen", "status", "verify"])
     p.add_argument("--suite", choices=datagen.SUITES, help="tpch, tpcds or etl (gen: required)")
     p.add_argument("--sf", type=int, help="scale factor, one of those in datagen/expected.yaml (gen: required)")
     p.add_argument("--force", action="store_true", help="with gen: regenerate tables that already validate")
+    p.add_argument("--engine", choices=engines_available(), help="with verify: engine that reads the tables")
+    p.add_argument("--against", choices=engines_available(),
+                   help="with verify: reference engine (default trino unless --engine is trino)")
     p.set_defaults(func=cmd_data)
 
     p = sub.add_parser("run", parents=[common], help="execute a run plan and record every cell")

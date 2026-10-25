@@ -30,8 +30,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 1 | Skeleton, `doctor`, local stack | S | ✅ done |
 | 2 | Data generation | M | ✅ done |
 | 3a | Measurement core with Trino | M | ✅ done |
-| 3b | `dfrunner` single mode (`df`) | L | next |
-| 4 | Analysis: diff, stats, summaries, full query catalogue | M | |
+| 3b | `dfrunner` single mode (`df`) | L | ✅ done |
+| 4 | Analysis: diff, stats, summaries, full query catalogue | M | next |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
@@ -216,7 +216,68 @@ methodology requires and records the results. No analysis yet.
   one command, or a privileged helper container.
 - Attributing `memory.peak` correctly to the Trino JVM.
 
-## Step 3b: `dfrunner` single mode (`df`)
+## Step 3b: `dfrunner` single mode (`df`) ✅
+
+**Delivered:**
+- **`dfrunner` (Rust, ~900 lines):** adapted from datafusion-distributed's
+  `remote-worker` and attributed in `NOTICE`.
+  - HTTP API: `/health`, `/status`, `POST /query` (Arrow IPC, structured errors),
+    `/queries/{id}` (stats, plan with metrics, pool peak), and cancel.
+  - Memory pool `TrackConsumersPool<GreedyMemoryPool>` at 4 GiB, with a per-query
+    high-water mark.
+  - Disk manager disabled (no spilling); `target_partitions=12`.
+  - Iceberg via datafusion-distributed-iceberg's catalog provider over the REST catalog.
+- **Pinned versions:**
+  - DataFusion 55.0.0 and arrow 59.3.0.
+  - datafusion-distributed 4.0.0 **@main ee3eacd**. The `v4.0.0` tag has no Iceberg
+    crate and no `remote-worker` (the lead checked: the crate was added on 2026-09-10,
+    and no tag includes it yet).
+  - iceberg-rust 0.10.1@5b82ab99 and datafusion-iceberg 0.12.0@20327db.
+- **Build:** multi-stage Docker build from pinned `rust:1.95.0-trixie` and
+  `debian:trixie-slim` (multi-arch digests). Thin LTO and mimalloc. The first build
+  took 406 s at ~4.7 GiB peak; a no-change rebuild takes 2 s.
+- **Python side:**
+  - `m0/engines/df.py` and `m0 env up --engine df`, with engine switching in the runner;
+  - `m0 data verify --engine` for engine-neutral table fingerprints;
+  - DataFusion classifier rules, tested against 10 real errors;
+  - a mechanical-override mechanism, enforced by the manifest.
+- **Smoke plan** now runs `trino` and `df` in ABBA order. 125 tests.
+
+**Acceptance (verified independently by the lead, 2026-10-25):**
+- `env up --engine df` starts from a stopped stack in 26 s, with the image cached.
+- **`data verify --engine df`:** 68/68 tables and 1,072/1,072 columns match Trino's
+  fingerprints. The values are real, e.g. the `lineitem` decimal sum
+  2,293,813,156,773.36 is identical. **iceberg-rust reads everything Trino writes.**
+- **Smoke run `verify-3b`:** 132 cells in 7.0 min.
+  - trino: 64 ok, 2 `err_mem` (X1_mem).
+  - df: 64 ok, 2 `timeout` (X1_mem).
+  - No metric nulls. `--resume` records nothing new.
+- **Hot medians at SF1** (informational only): df was faster on all 8 queries, by
+  1.2× (TPC-H q1) to 5.7× (J3). df pool peak ≤ 0.24 GiB, container ≤ 0.78 GiB.
+
+**Decisions taken by the lead during verification:**
+- Accepted the datafusion-distributed `main@ee3eacd` pin, since no tag contains the
+  Iceberg crate. Re-pin to a release tag once one includes it.
+- Accepted SeaweedFS read caps (`-s3.readerCacheSizeMB=256
+  -volume.concurrentDownloadLimitMB=256`). `df` scans OOM-killed the object store at
+  1 GiB. This is infrastructure that both engines use.
+- Methodology section 2 now records the dfrunner build (thin LTO, mimalloc): the
+  allocator is part of what's measured.
+
+**Findings (to record in `findings/` in step 4b):**
+- **F1, df CPU pathology.** X1_mem (`array_agg` fed by a cross join with UNNEST) runs
+  on one partition at ~40k rows/s and times out at 120 s. The pool stays at ~195 MB,
+  so it never reaches the memory limit. The same query with `count()` takes 4.2 s.
+  Suspected cause: very large cross-join batches meeting array_agg's per-group path.
+  Not confirmed.
+- **F2, df cancel doesn't stop CPU-bound operators.** The query keeps running at
+  100% CPU and holding pool memory after a cancel. The runner now restarts an engine
+  that's still busy after a timeout. This matters for B3 (a runaway query slows its
+  neighbours) and for Rino (query cancellation).
+- **F3, memory outside the pool.** A full window sort of SF10 `lineitem` fails
+  cleanly with `ResourcesExhausted` at a pool of 4.29 GB, but the container reached
+  5.4 GiB: ~1.1 GiB of RSS was outside the pool.
+
 
 **Goal.** Plain DataFusion runs the same plans as Trino, through the same runner and
 sampler.
@@ -269,6 +330,13 @@ sampler.
 
 ## Step 4: analysis, plus the full query catalogue
 
+**Carried over from 3b:**
+- **Decimal types differ.** Trino `sum` returns decimal(38,s) and `avg` rounds to the
+  input scale. DataFusion returns decimal(p+10,s) and `avg` at scale 6. The differ
+  must compare at Trino's scale.
+- **Stale schemas.** `df` caches table schemas per process, so restart it after data is
+  regenerated.
+
 **Goal.** Turn raw cells into answers.
 
 **Scope:**
@@ -293,6 +361,12 @@ sampler.
 - Every result is diffed. Each mismatch is classified or recorded as a finding.
 
 ## Step 4b: investigation helpers
+
+**Carried over from 3b:**
+- X1_mem doesn't exercise memory on `df` (finding F1). Add a deliberate memory cell
+  that fails cleanly on both engines, e.g. the full window sort from F3, and check its
+  behaviour on Trino.
+- Record findings F1–F3 in `findings/`.
 
 **Scope:**
 - Commands: `m0 triage`, `m0 repro`, `m0 bisect-mem`, `m0 diff`, `m0 sql`.
@@ -333,6 +407,12 @@ failure.
 **Carried over from 3a:** memory levels are expanded into blocks but not yet applied
 to the container, the pool or Trino's limits. The cgroup lookup assumes the systemd
 driver, with a cgroupfs fallback.
+
+**Also from 3b:**
+- `df`'s pool peak is process-wide, so per-query peaks don't hold under concurrency (B3).
+- A cancel can't interrupt CPU loops (F2).
+- iceberg-rust makes one scan task per file, and SF10 tables have ≤ 8 files for 12
+  partitions. Check scan parallelism, and how `dfd` splits work units.
 
 **Risks:**
 - Two engine nodes plus infra must fit in ~11.7 GiB for A3 (2 × ~4 GiB). This may

@@ -83,3 +83,27 @@ SELECT max(n) * 1e0 / sum(n) AS top_key_share FROM c
 | `HIVE_WRITER_CLOSE_ERROR` / S3 errors in a CTAS | `docker compose -p m0 ps --all` (objstore `Exited (137)`?) | SeaweedFS ran out of memory. Its limits are in `infra/local/compose.yaml`; `m0 env up --engine trino` restarts it. Re-run `m0 data gen`: it resumes. |
 | `rows X, expected Y` on a fresh build | Is the SF or connector config different? | A connector config change (`configs/trino/local/catalog/`) changes the data; never edit `expected.yaml` to match without understanding why |
 | `no expected count` | The etl SQL or params changed | Record the new counts in `expected.yaml` (exact, from the generator) |
+
+## Cross-engine check: `m0 data verify`
+
+Answers "can this engine read every table Trino wrote, with the same values?" Run it
+after data generation and after any engine library upgrade.
+
+```bash
+m0 env up --engine trino && m0 data verify --engine trino   # reference fingerprints
+m0 env up --engine df && m0 data verify --engine df         # compared with trino's
+```
+
+- Per table, one aggregate query through the engine: `count(*)`, plus per column the
+  non-null count, min, max, and `sum` (numerics) or `sum(length)` (strings). Column
+  types come from the Iceberg catalog, not from the engine.
+- Fingerprints: `results/verify/<engine>/<namespace>.json`; the comparison:
+  `results/verify/<engine>/vs-trino.json`. Integers and decimals must match exactly
+  (decimal scale ignored), floats within the methodology 8 tolerance.
+- A table whose query fails is retried column by column; each column that still fails
+  is reported `[unreadable]` with its error. Differences and unreadable columns give
+  exit code 3: they are findings to record, not things to work around.
+- `--suite`, `--sf` narrow it; `--against` picks another reference engine.
+- Last result (2026-10-24): `df` matches Trino on all 68 tables and 1,072 columns in
+  all six namespaces (tpch/tpcds/etl × SF1/SF10); no unreadable type. SF10 takes ~20 s
+  per engine.

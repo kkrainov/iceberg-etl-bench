@@ -8,6 +8,9 @@
 #   tie_ambiguous  LIMIT with possible ties on the sort keys (compare on sort keys only)
 #   rewrite        null, or the reason this query differs from its source text
 #   source         where the text comes from
+#   datafusion_override  (optional) reason for queries/overrides/datafusion/<suite>/<id>.sql,
+#                  used by df/dfd. Mechanical rewrites only (function name, syntax), never
+#                  a change of semantics; a query DataFusion can't express is err_unsupported.
 queries:
   - {suite: tpch, id: q01, class: tpc, namespaces: [tpch], ordered: true, tie_ambiguous: false, rewrite: null,
      source: "TPC-H v3.0.1 2.4.1, validation parameters"}
@@ -26,4 +29,5 @@ queries:
   - {suite: etl, id: J3, class: join, namespaces: [etl, tpcds], ordered: true, tie_ambiguous: false, rewrite: null,
      source: "this benchmark, B1 J3"}
   - {suite: etl, id: X1_mem, class: deliberate, namespaces: [etl], ordered: false, tie_ambiguous: false, rewrite: null,
-     source: "this benchmark, deliberate out-of-memory cell for smoke plans"}
+     source: "this benchmark, deliberate out-of-memory cell for smoke plans",
+     datafusion_override: "DataFusion has no sequence(); generate_series(1, 200) is the same inclusive integer array (Error during planning: Invalid function 'sequence')"}

@@ -129,12 +129,20 @@ class RunStore:
         return self.parquet
 
     # ---- result rows ----
-    def write_result(self, cell_id: str, columns: list[tuple[str, str]], rows: list[list],
-                     max_rows: int) -> str:
-        """Store result rows as Parquet; returns 'full' or 'truncated'."""
-        kept = rows[:max_rows]
-        table = result_table(columns, kept)
-        status = "full" if len(kept) == len(rows) else "truncated"
+    def write_result(self, cell_id: str, columns: list[tuple[str, str]], rows: list[list] | None,
+                     max_rows: int, table: pa.Table | None = None) -> str:
+        """Store result rows as Parquet; returns 'full' or 'truncated'.
+
+        Either `rows` with engine type names in `columns` (Trino), or an Arrow `table`
+        (DataFusion). Both end up with the comparable Arrow types of `comparable_type`.
+        """
+        if table is not None:
+            total = table.num_rows
+            table = normalize_table(table.slice(0, max_rows), columns)
+        else:
+            total = len(rows)
+            table = result_table(columns, rows[:max_rows])
+        status = "full" if table.num_rows == total else "truncated"
         while table.nbytes > RESULT_BYTES_CAP and table.num_rows > 1:
             table, status = table.slice(0, table.num_rows // 2), "truncated"
         d = self.dir / "rows"
@@ -159,6 +167,36 @@ def arrow_type(engine_type: str) -> pa.DataType | None:
     if t.startswith("timestamp(") and "withtimezone" not in t:
         return pa.timestamp("us")
     return None
+
+
+def comparable_type(t: pa.DataType) -> pa.DataType:
+    """Arrow type used in stored results, so both engines' results compare (step 4 differ).
+
+    Physical-layout variants collapse to one logical type: string/binary views and large
+    variants -> string/binary, dictionaries -> their value type, lists recursively.
+    Numeric, decimal, date and timestamp types are kept as the engine returned them
+    (the differ normalises decimals by scale and timestamps to UTC, methodology 8).
+    """
+    if pa.types.is_dictionary(t):
+        return comparable_type(t.value_type)
+    if pa.types.is_string_view(t) or pa.types.is_large_string(t):
+        return pa.string()
+    if pa.types.is_binary_view(t) or pa.types.is_large_binary(t):
+        return pa.binary()
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_list_view(t) or pa.types.is_large_list_view(t):
+        return pa.list_(comparable_type(t.value_type))
+    return t
+
+
+def normalize_table(table: pa.Table, columns: list[tuple[str, str]] | None = None) -> pa.Table:
+    arrays = []
+    for col in table.columns:
+        target = comparable_type(col.type)
+        arrays.append(col if target == col.type else col.cast(target))
+    names = table.column_names
+    types = [t for _, t in columns] if columns else [str(f.type) for f in table.schema]
+    meta = {"engine_types": json.dumps(types)}
+    return pa.Table.from_arrays(arrays, names=names).replace_schema_metadata(meta)
 
 
 def result_table(columns: list[tuple[str, str]], rows: list[list]) -> pa.Table:

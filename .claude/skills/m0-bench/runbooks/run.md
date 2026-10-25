@@ -4,7 +4,9 @@
 
 1. `m0 doctor` (no FAIL), and ask the user about machine hygiene (power plan,
    background apps) if the numbers will be used.
-2. `m0 env up --engine trino`, and `m0 data status --sf 1` (or the plan's SF).
+2. `m0 env up --engine trino`, and `m0 data status --sf 1` (or the plan's SF). For a
+   plan with `df`, build it once with `m0 env up --engine df` (the runner starts and
+   stops engines itself, but doesn't build the image).
 3. Nothing else heavy on the machine: the engine gets 8 GiB of ~11.7 GiB.
 
 ## Commands
@@ -38,11 +40,19 @@ and the `runs.parquet` path.
   15 s. `per_query` does this before every query, `per_block` once per block.
   Each restart and cache drop is a line in `run.log`.
 - **Per cell:** wall time = execute + fetch all rows (harness clock); cgroup CPU and
-  memory for the engine and `objstore`; Trino's final query info from
-  `/v1/query/{id}`; a health check (`/v1/info` + `SELECT 1`); the outcome from
-  `m0/classify_rules.yaml`.
-- **Timeout** (`timeout_s`, 600 s by default): the query is cancelled
-  (`DELETE /v1/query/{id}`) and the cell is `timeout`.
+  memory for the engine and `objstore`; final engine stats (Trino `/v1/query/{id}`,
+  dfrunner `/queries/{id}`); a health check (`/v1/info` or `/health`, plus `SELECT 1`);
+  the outcome from `m0/classify_rules.yaml`.
+- **SQL:** canonical Trino text from `queries/<suite>/<id>.sql`; `df` uses
+  `queries/overrides/datafusion/<suite>/<id>.sql` where the manifest gives a
+  `datafusion_override` reason. `cells/<cell_id>/query.sql` is what actually ran.
+- **Engines switch per block:** the runner stops the other engine and recreates the
+  block's engine (`df` or `trino`), so only one engine ever runs.
+- **Timeout** (`timeout_s`, 600 s by default; a plan entry can set its own
+  `timeout_s`): the query is cancelled (Trino `DELETE /v1/query/{id}`, dfrunner
+  `DELETE /queries/{id}`) and the cell is `timeout`. If dfrunner is still busy after
+  the cancel (pool memory still reserved), the engine is restarted before the next cell
+  (`INFO restarted df after timeout (engine still busy after cancel)`).
 - **After `killed` or `unresponsive`** the engine is restarted before the next cell
   (logged, `INFO restarted …` on stdout).
 - Results are appended per cell, so Ctrl-C or a crash loses at most the running cell.
@@ -58,7 +68,7 @@ and the `runs.parquet` path.
 | `run.log` | Start, restarts (with reason and seconds), cache drops, non-`ok` cells |
 | `env.json` | git SHA, image digests, host, WSL config, config hashes, plan, times |
 | `cells/<cell_id>/query.sql` | The exact SQL that ran |
-| `cells/<cell_id>/engine_stats.json` | Trino query info, trimmed: state, errorCode, failureInfo (no stacks), queryStats |
+| `cells/<cell_id>/engine_stats.json` | Trino: query info, trimmed (state, errorCode, failureInfo without stacks, queryStats). df: dfrunner stats (elapsed/planning/execution ms, process CPU, `pool {limit, at_start, peak, at_end}`, `error {variant, contexts, message}`, `metrics.operators` per operator, `metrics.plan` with metrics) |
 | `cells/<cell_id>/memory.csv` | `t_ms,engine_bytes,objstore_bytes` at 20 Hz |
 | `rows/<cell_id>.parquet` | Result rows of iteration-0 cells (for the step 4 differ) |
 
@@ -78,6 +88,10 @@ uv run python -c "import pyarrow.parquet as pq; t = pq.read_table('results/smoke
   the query's own reservation.
 - `cpu_s` (cgroup) includes JIT, GC and background threads, so it's above
   `engine_cpu_s`, most of all on cold runs.
+- **df:** `engine_peak_mem_bytes` is the DataFusion pool high-water mark (reset per
+  query); `peak_mem_bytes` (container) minus it is memory the pool doesn't track.
+  `engine_cpu_s` is dfrunner's process CPU (getrusage) during the query. dfrunner has no
+  JVM, so its container memory falls back after each query, unlike Trino's.
 - `ok` currently means "completed"; result comparison arrives with step 4
   (`diff_status = pending`).
 

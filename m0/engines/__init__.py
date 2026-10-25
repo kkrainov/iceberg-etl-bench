@@ -8,11 +8,15 @@ def get(name: str) -> Engine:
         from m0.engines.trino import TrinoEngine
 
         return TrinoEngine()
+    if name == "df":
+        from m0.engines.df import DfEngine
+
+        return DfEngine()
     raise KeyError(f"no adapter for engine {name!r} yet")
 
 
 def available() -> tuple[str, ...]:
-    return ("trino",)
+    return ("trino", "df")
 
 
 __all__ = ["Engine", "ExecResult", "available", "get"]

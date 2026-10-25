@@ -44,18 +44,22 @@ row-level DML, and SQL dialect compatibility.
 
 ## Quick start
 
-Requires Docker (cgroup v2), [uv](https://docs.astral.sh/uv/) and, from build
-step 3, a Rust toolchain.
+Requires Docker (cgroup v2, BuildKit) and [uv](https://docs.astral.sh/uv/). The
+DataFusion runner (`dfrunner/`, Rust) is built inside Docker from pinned images, so no
+host Rust toolchain is needed to run the benchmark.
 
 ```bash
 uv run m0 doctor                       # check prerequisites and machine settings
 uv run m0 env up --engine trino        # local stack: object store, Iceberg REST catalog, Trino
+uv run m0 env up --engine df           # or plain DataFusion (builds dfrunner, ~7 min the first time)
 uv run m0 env status
 uv run m0 env down                     # stop; data is kept
 ```
 
 Then `uv run m0 data gen --suite tpch --sf 1` (and `tpcds`, `etl`) and
-`uv run m0 run plans/phase-l-smoke.yaml`. Planned, not implemented yet: `m0 summarize`
+`uv run m0 run plans/phase-l-smoke.yaml` (Trino and DataFusion in ABBA order).
+`uv run m0 data verify --engine df` checks that DataFusion reads every table with the
+same values as Trino. Planned, not implemented yet: `m0 summarize`
 and the rest of the CLI in [framework-design.md](docs/framework-design.md#the-m0-cli-an-interface-designed-for-the-agent).
 
 ## About Rino

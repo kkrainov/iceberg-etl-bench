@@ -98,7 +98,17 @@ def test_smoke_plan_shape():
     cells = plan_mod.expand(p)
     assert p["sf"] == 1 and p["cold"] == "per_block"
     assert [c for c in cells if c.expect == "err_mem"]
-    assert len(cells) == 8 * 4 + 1
+    # Two engines, two rounds (ABBA), 8 queries x (1 + 3 hot) + X1_mem per block.
+    assert len(cells) == 4 * (8 * 4 + 1)
+    blocks = [c.engine for c in cells if c.seq == 0 or c.block != cells[c.seq - 1].block]
+    assert blocks == ["trino", "df", "df", "trino"]
+
+
+def test_every_manifest_query_renders_for_every_engine():
+    for q in load_manifest().values():
+        for engine in ("trino", "df", "dfd"):
+            sql = render(q, 1, engine)
+            assert "${" not in sql and "iceberg." in sql
 
 
 def test_every_manifest_query_renders():

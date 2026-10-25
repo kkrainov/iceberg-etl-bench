@@ -221,3 +221,7 @@ class TrinoEngine(Engine):
 
     def config_files(self) -> list:
         return sorted(p for p in CONFIG_DIR.rglob("*") if p.is_file())
+
+    def describe(self) -> dict:
+        status, info = self._get("/v1/info", timeout=5)
+        return {"version": (info or {}).get("nodeVersion", {}).get("version")} if status == 200 else {}

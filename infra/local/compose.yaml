@@ -17,8 +17,12 @@ services:
       -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
       -volume.max=0 -master.volumeSizeLimitMB=1024
       -s3.concurrentUploadLimitMB=256 -volume.concurrentUploadLimitMB=256
+      -s3.readerCacheSizeMB=256 -volume.concurrentDownloadLimitMB=256
     # Bounded upload buffers plus a Go soft memory limit: without them, multi-GB
     # CTAS writes from Trino (data generation) got SeaweedFS OOM-killed at 768m.
+    # Bounded read buffers (step 3b): DataFusion's scans (many concurrent ranged GETs)
+    # drove unbounded reader buffers to the 1 GiB limit and SeaweedFS was OOM-killed;
+    # the same caps apply to both engines.
     environment:
       GOMEMLIMIT: 640MiB
     volumes:
@@ -90,6 +94,41 @@ services:
       interval: 3s
       timeout: 5s
       retries: 60
+    depends_on:
+      catalog:
+        condition: service_healthy
+      objstore:
+        condition: service_healthy
+    mem_limit: ${M0_ENGINE_MEM:-8g}
+    memswap_limit: ${M0_ENGINE_MEM:-8g}
+    cpus: ${M0_ENGINE_CPUS:-12}
+
+  # Plain DataFusion (engine `df`): dfrunner in `single` mode, built locally from
+  # ../../dfrunner (pinned builder/runtime images from versions.lock.yaml).
+  df:
+    profiles: ["df"]
+    image: m0-dfrunner:local
+    build:
+      context: ../../dfrunner
+      args:
+        BUILDER_IMAGE: ${M0_IMAGE_DFRUNNER_BUILDER}
+        RUNTIME_IMAGE: ${M0_IMAGE_DFRUNNER_RUNTIME}
+    command: ["single"]
+    # tini as PID 1: dfrunner has no SIGTERM handler, so without it every stop (engine
+    # switch, cold restart) waited out Docker's 10 s grace period before SIGKILL.
+    init: true
+    environment:
+      <<: *s3-creds
+      RUST_LOG: info
+    volumes:
+      - ../../configs/datafusion/local/dfrunner.properties:/etc/dfrunner/dfrunner.properties:ro
+    ports:
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/dfrunner", "healthcheck"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
     depends_on:
       catalog:
         condition: service_healthy

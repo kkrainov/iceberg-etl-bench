@@ -1,0 +1,92 @@
+_comment: 'Real errors from dfrunner (DataFusion 55.0.0, datafusion-distributed main@ee3eacd) via m0.engines.df, 2026-10-24.
+  resources_exhausted: full sort of tpch_sf10.lineitem in a window with spilling disabled; x1_canonical_sequence: the canonical
+  (Trino) X1_mem text.'
+errors:
+  syntax:
+    error_name: SQL
+    error_type: null
+    error_code: 422
+    message: 'SQL error: ParserError("Expected: an SQL statement, found: SELEC at Line: 1, Column: 1")'
+    exception: DataFusionError::SQL
+    expect: err_unsupported
+  function:
+    error_name: Plan
+    error_type: null
+    error_code: 422
+    message: 'Error during planning: Invalid function ''no_such_fn''.
+
+      Did you mean ''to_char''?'
+    exception: DataFusionError::Plan
+    expect: err_unsupported
+  table:
+    error_name: Plan
+    error_type: null
+    error_code: 422
+    message: 'Error during planning: table ''iceberg.tpch_sf1.nope'' not found'
+    exception: DataFusionError::Plan
+    expect: err_other
+  schema:
+    error_name: Plan
+    error_type: null
+    error_code: 422
+    message: 'Error during planning: table ''iceberg.nope_ns.region'' not found'
+    exception: DataFusionError::Plan
+    expect: err_other
+  div0:
+    error_name: ArrowError
+    error_type: null
+    error_code: 422
+    message: 'Arrow error: Divide by zero error'
+    exception: DataFusionError::ArrowError
+    expect: err_other
+    unrecognised: true
+  cast:
+    error_name: ArrowError
+    error_type: Optimizer rule 'simplify_expressions' failed
+    error_code: 422
+    message: 'Optimizer rule ''simplify_expressions'' failed
+
+      caused by
+
+      Arrow error: Cast error: Cannot cast string ''x'' to value of Int32 type'
+    exception: DataFusionError::ArrowError
+    expect: err_other
+    unrecognised: true
+  not_implemented:
+    error_name: NotImplemented
+    error_type: null
+    error_code: 422
+    message: 'This feature is not implemented: Physical plan does not support logical expression InSubquery(InSubquery { expr:
+      Column(Column { relation: Some(Full { catalog: "iceberg", schema: "tpch_sf1", table: "region" }), name: "r_regionkey"
+      }), subquery: <subquery>, negated: false })'
+    exception: DataFusionError::NotImplemented
+    expect: err_unsupported
+  ddl:
+    error_name: Plan
+    error_type: null
+    error_code: 422
+    message: 'Error during planning: DDL not supported: CreateMemoryTable'
+    exception: DataFusionError::Plan
+    expect: err_unsupported
+  x1_canonical_sequence:
+    error_name: Plan
+    error_type: null
+    error_code: 422
+    message: 'Error during planning: Invalid function ''sequence''.
+
+      Did you mean ''coalesce''?'
+    exception: DataFusionError::Plan
+    expect: err_unsupported
+  resources_exhausted:
+    error_name: ResourcesExhausted
+    error_type: null
+    error_code: 422
+    message: "Resources exhausted: Additional allocation failed for ExternalSorterMerge[2] with top memory consumers (across\
+      \ reservations) as:\n  ExternalSorterMerge[3]#237(can spill: false) consumed 648.8 MB, peak 648.8 MB,\n  ExternalSorterMerge[4]#240(can\
+      \ spill: false) consumed 595.7 MB, peak 595.7 MB,\n  ExternalSorterMerge[6]#245(can spill: false) consumed 555.6 MB,\
+      \ peak 555.6 MB,\n  ExternalSorterMerge[1]#231(can spill: false) consumed 532.7 MB, peak 532.7 MB,\n  ExternalSorterMerge[2]#234(can\
+      \ spill: false) consumed 522.4 MB, peak 522.4 MB.\nError: Failed to allocate additional 308.0 KB for ExternalSorterMerge[2]\
+      \ with 206.4 MB already allocated for this reservation - 285.0 KB remain available for the total memory pool: greedy(used:\
+      \ 4.0 GB, pool_size: 4.0 GB)"
+    exception: DataFusionError::ResourcesExhausted
+    expect: err_mem

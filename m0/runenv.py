@@ -61,6 +61,14 @@ def wsl_info() -> dict | None:
     return {"path": str(path) if path else None, "text": path.read_text(errors="replace") if path else None}
 
 
+def _describe(engine) -> dict:
+    """Engine-reported versions and settings, if the engine is up (best effort)."""
+    try:
+        return engine.describe()
+    except Exception as e:  # engine not running yet
+        return {"error": str(e)[:200]}
+
+
 def collect(engines: list, plan: dict) -> dict:
     lock = versions.load()
     containers = {}
@@ -76,6 +84,7 @@ def collect(engines: list, plan: dict) -> dict:
         "wsl": wsl_info(),
         "engine_configs": {e.name: {str(p.relative_to(REPO_ROOT)): file_hash(p) for p in e.config_files()}
                            for e in engines},
+        "engine_info": {e.name: _describe(e) for e in engines},
         "containers": containers,
         "plan": plan,
     }

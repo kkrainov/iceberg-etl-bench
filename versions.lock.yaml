@@ -9,12 +9,25 @@ images:
   objstore: chrislusf/seaweedfs:4.48                # S3-compatible storage (Phase L only)
   # Short-lived privileged helper for cold runs: `sync; echo 3 > /proc/sys/vm/drop_caches`.
   # Pinned by digest because busybox tags are rebuilt.
+  # dfrunner (engine `df`, later `dfd`) build: Rust builder and slim runtime, pinned by
+  # multi-platform index digest (amd64 now, arm64 in Phase C). Rust 1.95 is the minimum
+  # datafusion-distributed-iceberg declares (rust-version = "1.95.0").
+  dfrunner_builder: rust:1.95.0-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3
+  dfrunner_runtime: debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
   cache_drop: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 
+# Resolved by dfrunner/Cargo.lock (committed); dfrunner's /status reports the same values.
 engines:
-  datafusion: "55"                                  # resolved by dfrunner/Cargo.lock (step 3)
-  datafusion_distributed: "4.0.0"
-  iceberg_rust: 5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3   # rev used by datafusion-distributed-iceberg
+  datafusion: "55.0.0"
+  # Crate version 4.0.0 at main@ee3eacd (2026-10-24). The v4.0.0 tag (4cfa166, 2026-08-20)
+  # has neither the Iceberg crate nor benchmarks/remote-worker; both, and the revisions
+  # below, exist only on main after the tag.
+  datafusion_distributed: "4.0.0@ee3eacd93af66e4ef2e2e72a253842c723f92ca5"
+  datafusion_distributed_iceberg: "0.1.0@ee3eacd93af66e4ef2e2e72a253842c723f92ca5"
+  iceberg_rust: "0.10.1@5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3"        # incl. iceberg-catalog-rest
+  datafusion_iceberg: "0.12.0@20327db58c7a44330366da00a34a26e866d0da4d"  # apache/datafusion-iceberg
+  arrow: "59.3.0"
+  rust: "1.95.0"
 
 tools:
   python: ">=3.12"

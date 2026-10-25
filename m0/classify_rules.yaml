@@ -8,7 +8,11 @@
 # Then the first rule below whose fields all match wins. Fields are regexes:
 # `error_name` and `error_type` must match fully; `message` is searched.
 # An error no rule matches is err_other with unrecognised=true.
-# Every rule needs a test with a real error string (tests/fixtures/trino_errors.yaml).
+# `engine` is one engine or a list. Every rule needs a test with a real error string
+# (tests/fixtures/trino_errors.yaml, tests/fixtures/df_errors.yaml).
+# DataFusion (dfrunner): error_name = root DataFusionError variant (ResourcesExhausted,
+# NotImplemented, SQL, Plan, Execution, ArrowError, ...), error_type = first context label
+# (e.g. IcebergError(FeatureUnsupported)), message = the full DataFusion message.
 killed_exit_codes: [137]
 memory_exit_codes:
   trino: [3]
@@ -30,3 +34,33 @@ rules:
     engine: trino
     outcome: err_other
     error_name: (TABLE|SCHEMA|CATALOG|COLUMN)_NOT_FOUND
+
+  # ---- DataFusion (df; dfd from step 5) ----
+  - id: df.memory_limit
+    engine: [df, dfd, dfd-jo]
+    outcome: err_mem
+    error_name: ResourcesExhausted
+  - id: df.not_implemented
+    engine: [df, dfd, dfd-jo]
+    outcome: err_unsupported
+    error_name: NotImplemented
+  - id: df.syntax
+    engine: [df, dfd, dfd-jo]
+    outcome: err_unsupported
+    error_name: SQL
+  - id: df.iceberg_unsupported
+    engine: [df, dfd, dfd-jo]
+    outcome: err_unsupported
+    error_type: IcebergError\(FeatureUnsupported\)
+  # Plan errors: a missing table is not a missing feature; an unknown function or an
+  # unsupported construct is.
+  - id: df.missing_object
+    engine: [df, dfd, dfd-jo]
+    outcome: err_other
+    error_name: Plan
+    message: "table '[^']+' not found|[Ss]chema .* not found|No field named"
+  - id: df.unsupported_plan
+    engine: [df, dfd, dfd-jo]
+    outcome: err_unsupported
+    error_name: Plan
+    message: "Invalid function|[Nn]ot supported|[Uu]nsupported"

@@ -42,6 +42,7 @@ class Cell:
     cold: bool            # iteration 0 directly after an engine restart and page-cache drop
     restart_before: bool  # the runner restarts the engine and drops caches before this cell
     expect: str | None    # outcome the plan expects (deliberate failures); None = ok
+    timeout_s: float | None = None  # per-entry timeout; None = the plan's timeout_s
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -88,19 +89,20 @@ def validate(plan: dict, manifest: dict[str, Query] | None = None) -> None:
                 raise PlanError(f"query {entry['suite']}/{qid} is not in queries/manifest.yaml")
 
 
-def query_list(plan: dict) -> list[tuple[str, str, int, str | None]]:
-    """(suite, id, hot iterations, expected outcome) in plan order."""
+def query_list(plan: dict) -> list[tuple[str, str, int, str | None, float | None]]:
+    """(suite, id, hot iterations, expected outcome, timeout override) in plan order."""
     out = []
     for entry in plan["queries"]:
+        timeout = entry.get("timeout_s")
         for qid in entry["ids"]:
             out.append((entry["suite"], str(qid), int(entry.get("iterations", plan["iterations"])),
-                        entry.get("expect")))
-    if len({(s, q) for s, q, _, _ in out}) != len(out):
+                        entry.get("expect"), float(timeout) if timeout is not None else None))
+    if len({(q[0], q[1]) for q in out}) != len(out):
         raise PlanError("a query is listed twice")
     return out
 
 
-def round_order(plan: dict, rnd: int) -> list[tuple[str, str, int, str | None]]:
+def round_order(plan: dict, rnd: int) -> list[tuple[str, str, int, str | None, float | None]]:
     queries = sorted(query_list(plan), key=lambda q: (q[0], q[1]))
     random.Random(f"{plan['seed']}/{rnd}").shuffle(queries)
     return queries
@@ -115,11 +117,12 @@ def expand(plan: dict) -> list[Cell]:
         for engine in engines:
             for mem in plan["mem_levels"]:
                 first_in_block = True
-                for suite, qid, hot, expect in order:
+                for suite, qid, hot, expect, timeout in order:
                     for it in range(hot + 1):
                         restart = it == 0 and (plan["cold"] == "per_query" or first_in_block)
                         cells.append(Cell(make_cell_id(engine, int(mem), rnd, suite, qid, it), len(cells), block,
-                                          rnd, engine, int(mem), suite, qid, it, restart, restart, expect))
+                                          rnd, engine, int(mem), suite, qid, it, restart, restart, expect,
+                                          timeout))
                         first_in_block = False
                 block += 1
     ids = [c.cell_id for c in cells]

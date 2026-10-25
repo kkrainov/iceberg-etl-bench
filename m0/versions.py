@@ -4,7 +4,7 @@ import yaml
 
 from m0.paths import VERSIONS_LOCK
 
-REQUIRED_IMAGES = ("trino", "catalog", "catalog_db", "objstore", "cache_drop")
+REQUIRED_IMAGES = ("trino", "catalog", "catalog_db", "objstore", "cache_drop", "dfrunner_builder", "dfrunner_runtime")
 
 
 def load() -> dict:
