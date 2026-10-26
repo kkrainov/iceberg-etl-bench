@@ -185,3 +185,15 @@ def test_diff_answers_reference_and_no_reference():
     ds = differ.diff_answers([answer("df", ["Int64"], [[1]]), answer("dfd", ["Int64"], [[2]])], manifest_entry())
     assert {d.status for d in ds} == {"no_reference"}
     assert "vs dfd: mismatch" in ds[0].detail
+
+
+def test_ordered_rows_equal_within_one_unit_match_although_sorting_interleaves_them():
+    # TPC-DS q36 at SF10: each value is one unit lower on one side, so sorting the two
+    # sides as multisets pairs different rows; row by row they are equal.
+    t = ["decimal(38, 6)", "varchar"]
+    ref = [["-0.434697", "Shoes"], ["-0.434696", "Jewelry"]]
+    got = [["-0.434696", "Shoes"], ["-0.434696", "Jewelry"]]
+    assert cmp(t, ref, t, got, ordered=False).status == differ.MISMATCH  # sorted pairing is off
+    d = cmp(t, ref, t, got, ordered=True, sort_keys=(2,))
+    assert d.status == differ.MATCH
+    assert "decimal_ulp" in d.rules

@@ -524,6 +524,34 @@ written only for cells named by the plan key `diag`.
   expression; checked by hand at the cut, no ties. Re-check at SF10.
 - `df` `scan_ms` is still null (from 3c); decide in step 5.
 
+## Phase L result: A1+A2 at SF10 (2026-10-26)
+
+Run `phase-l-a1a2-sf10-20261026-190808Z` (plan `phase-l-a1a2-sf10`: cold per query,
+5 hot, 2 rounds ABBA, 600 s timeout): 3,000 cells in 172.6 min.
+- `trino` ok 1500. `df` ok 1404, ok_mismatch 36, err_mem 60.
+- Hot geomean trino/df: TPC-DS 1.73× [1.71–1.76], TPC-H 1.57× [1.53–1.61]; all
+  queries 1.70× (SF1: 1.73×). Totals over common queries: TPC-DS 134.2 s vs 94.6 s,
+  TPC-H 32.6 s vs 23.0 s (1.42× each): the lead is smaller on the heaviest queries
+  (tpcds q23a 1.52×, q67 1.12×, q22 0.95×, q04 0.78×).
+- Per-query ratio p10/p50/p90 0.88 / 1.80 / 3.54; `df` slower on 19 of 120. Largest
+  drops from SF1: tpcds q99 0.59 → 0.20, q62 0.84 → 0.29, q09 2.85 → 0.89, q78, q19.
+- Cold geomean 4.58×: mostly the JVM warming up after each restart, not storage.
+  Report cold separately and say so.
+- Peak memory (engine-reported, queries both completed): `df` / `trino` geomean
+  2.48×, median 1.68×. The two engines report different things (DataFusion pool
+  peak, Trino peak user memory); treat as rough.
+- `err_mem` on `df`: tpcds q21, q39a, q39b, q72, tpch q18, every iteration of both
+  rounds. 57 cells fail building a hash join (`HashJoinInput`), 3 (q39a, q39b, q18)
+  in a spilling operator with spill disabled. Trino's peak on these: q21 1–40 MB,
+  q39 50–540 MB, q72 130–340 MB, q18 1.3–1.6 GB.
+- Answers: 117 match, 3 mismatch. q61, q66: decimal division precision (F6). q44:
+  Trino's `avg` on decimal(7,2) keeps scale 2, which creates ties, so `rank()` gives
+  1,2,3,3,5,6,6,… where DataFusion (scale 6) gives 1,2,3,4,5,6,7,…; a genuine
+  difference a Trino drop-in must match (F6).
+- Differ fix found by this run: q36 was a false mismatch. Values one unit apart
+  sorted differently on the two sides, so the multiset pairing was off; ordered
+  answers equal row by row now match first (test added).
+
 ## Step 4c: join-order variant (A6, single node)
 
 **Goal.** Tell how much of DataFusion's join problems at SF10 the upstream join-order

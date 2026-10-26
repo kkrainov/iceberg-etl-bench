@@ -250,6 +250,14 @@ def compare(ref: dict, got: dict, ordered: bool, sort_keys: tuple[int, ...] = ()
         keys = list(range(len(keys)))
         rules.add("sort_keys_only")
 
+    # An ordered answer equal row by row is both the same multiset and the same order.
+    # Checked first: sorting values that differ within tolerance (one decimal unit, a
+    # float epsilon) can interleave near-equal rows differently on the two sides.
+    if ordered and all(rows_equal(a, b, cols, rules) is None for a, b in zip(rrows, grows, strict=True)):
+        out.rules = sorted(rules)
+        if truncated:
+            out.detail = f"compared the first {len(rrows)} of {ref['row_count']} rows (truncated, ordered)"
+        return out
     # Multiset: sort both sides by a total order and compare pairwise.
     rs, gs = sorted(rrows, key=_sort_key), sorted(grows, key=_sort_key)
     for i, (a, b) in enumerate(zip(rs, gs, strict=True)):
