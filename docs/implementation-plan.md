@@ -575,11 +575,17 @@ All fail while building a hash join (`HashJoinInput`). Upstream state (checked
   the data supports, e.g. statistics for filtered Iceberg scans, memory-aware build
   sides, dynamic filters into the Iceberg scan, a pluggable cost model for
   distributed exchanges.
+- **Draft** `drafts/datafusion-distributed-609-comment.md` (not posted): the case for
+  filter pushdown into the Iceberg scan, from tpcds q21 (and any other query where
+  the data shows it). Trino's peak memory vs `df` / `df-jo-cs`, with the plans: rows
+  scanned from the fact table and whether a join dynamic filter reached the scan.
+  Mention that draft #801 (Iceberg scans as `FileScanConfig`) would let DataFusion's
+  own Parquet pushdown apply. Offer to help once the scan design settles.
 
 **Acceptance:**
 - All three variants run the SF10 plan to completion; every query has an outcome.
 - Answers diffed against Trino like any other engine.
-- A results table (outcomes, geomean, memory) and the draft comment, in the plan.
+- A results table (outcomes, geomean, memory) in the plan, and both draft comments.
 
 **Risks:**
 - Backport conflicts with code that changed after 55.0.0 (statistics registry,
