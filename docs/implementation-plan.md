@@ -33,7 +33,7 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
 | 3c | Simplify result storage (JSON only, fewer artifacts) | S | ✅ done |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | ✅ done |
-| 4c | Join-order variant early: `df-cs`, `df-jo`, `df-jo-cs` at SF10 (A6, single node) | M | next |
+| 4c | Join-order variants early: `df-cs`, `df-jo(-cs)`, `df-sail(-cs)` at SF10 (A6, single node) | M | next |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
@@ -559,14 +559,27 @@ All fail while building a hash join (`HashJoinInput`). Upstream state (checked
     the options (e.g. building against the PR branch with the other dependencies
     adapted) instead of picking one.
   - `df-jo-cs`: `df-jo` with column statistics on.
+  - `df-sail`, `df-sail-cs`: dfrunner with Sail's downstream `JoinReorder` physical
+    optimizer rule (lakehq/sail `crates/sail-physical-optimizer/src/join_reorder/`,
+    Apache-2.0, DPHyp with a greedy fallback, up to 12 relations, a fact-anchor
+    heuristic, build side weighted 10× the probe side). Sail registers it in its own
+    physical optimizer rule list just before `JoinSelection`; do the same in dfrunner.
+    Copy the module with attribution (`Derived from` line, `NOTICE`), pin the Sail
+    commit. Sail `main` is on DataFusion 55.2.0: prefer adapting the module to
+    55.0.0 so only the rule differs from `df`; if that's not practical, stop and report
+    rather than moving the variant (or all of dfrunner) to 55.2.0. Default
+    `JoinReorderOptions`.
   - Each variant is a compose service with the same limits as `df`; engine names
     map to the DataFusion dialect and overrides. `versions.lock.yaml` records the PR
     head commit and the patch's hash. `run.json` records which variant ran.
 - **Plan** `plans/phase-l-a6-sf10.yaml`: all A1+A2 queries on `df-cs`, `df-jo`,
-  `df-jo-cs`, the SF10 run's protocol (cold per query, 5 hot, 600 s timeout).
+  `df-jo-cs`, `df-sail`, `df-sail-cs`; cold per query, 3 hot runs (fewer than A1/A2
+  to keep five variants to one overnight run), 600 s timeout.
   Compared with `trino` and `df` from the SF10 run via `m0 compare` (same machine,
   same data); if the comparison needs both baselines in one run, say so.
-- **Analysis:** per variant, outcomes (the five `err_mem` queries in particular),
+- **Analysis:** PR #24456 vs Sail (same algorithm family, different tuning): which
+  fixes the failing queries, regressions, and whether Sail's build-side weighting
+  lowers peak memory. Per variant, outcomes (the five `err_mem` queries in particular),
   geomean vs `trino` and `df`, regressions vs `df`, peak memory on join-heavy
   queries. `m0 explain` the five queries on `df`, `df-jo-cs` and `trino` (build
   side, rows into each join, whether the scan received a dynamic filter).
@@ -583,7 +596,7 @@ All fail while building a hash join (`HashJoinInput`). Upstream state (checked
   own Parquet pushdown apply. Offer to help once the scan design settles.
 
 **Acceptance:**
-- All three variants run the SF10 plan to completion; every query has an outcome.
+- All five variants run the SF10 plan to completion; every query has an outcome.
 - Answers diffed against Trino like any other engine.
 - A results table (outcomes, geomean, memory) in the plan, and both draft comments.
 

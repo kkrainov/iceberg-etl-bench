@@ -26,6 +26,7 @@ used as evidence. Its known weaknesses are summarised in the report.
 | `dfd` | DataFusion + datafusion-distributed | 4.0.0 (main@ee3eacd: the v4.0.0 tag has no Iceberg crate) | Coordinator + N workers over Arrow Flight; any node can coordinate |
 | `df-cs` | `df` with Iceberg column statistics on (`iceberg.column_stats_enabled=true`; off by default) | Same build as `df` | Suite A6 only: separates missing statistics from missing join ordering |
 | `df-jo`, `df-jo-cs` | `df` (and `df-cs`) with apache/datafusion#24456 (join-order enumeration) backported onto DataFusion 55.0.0 | PR head commit pinned | Suite A6 in Phase L; unreleased code, clearly labelled |
+| `df-sail`, `df-sail-cs` | `df` (and `df-cs`) with Sail's downstream `JoinReorder` physical optimizer rule (lakehq/sail, Apache-2.0) | Sail commit pinned | Suite A6 in Phase L; a downstream rule, not part of DataFusion |
 | `dfd-jo` | `dfd` with apache/datafusion#24456 (join-order enumeration) applied | Commit pinned | Suite A6 only; clearly labelled as unreleased code |
 
 **Configuration rules**
