@@ -33,7 +33,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
 | 3c | Simplify result storage (JSON only, fewer artifacts) | S | ✅ done |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | ✅ done |
-| 4b | Investigation helpers and deliberate failures | S | next |
+| 4c | Join-order variant early: `df-cs`, `df-jo`, `df-jo-cs` at SF10 (A6, single node) | M | next |
+| 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
 | L | Phase L execution and Gate L | M | |
@@ -523,6 +524,68 @@ written only for cells named by the plan key `diag`.
   expression; checked by hand at the cut, no ties. Re-check at SF10.
 - `df` `scan_ms` is still null (from 3c); decide in step 5.
 
+## Step 4c: join-order variant (A6, single node)
+
+**Goal.** Tell how much of DataFusion's join problems at SF10 the upstream join-order
+work fixes, and whether the missing piece is statistics or ordering. Requested by the
+user on 2026-10-26, ahead of step 5. Results feed a draft comment for
+apache/datafusion#24456 (draft only; the user decides whether to post it).
+
+**Why now.** In the SF10 run, five queries fail on `df` with `err_mem` while Trino
+completes them with 10× to 1000× less memory: tpcds q21, q39a, q39b, q72 and tpch q18.
+All fail while building a hash join (`HashJoinInput`). Upstream state (checked
+2026-10-26):
+- DataFusion 55 has no cost-based join reordering; `JoinSelection` only swaps the
+  build side of each join from row counts and byte sizes.
+- apache/datafusion#24456 (cost-based join enumeration, DPhyp, `join_enumeration`
+  on by default, up to 16 inputs) is open, conflicting with main, head
+  `472e83e1`, 728 commits past the 55.0.0 tag. It depends on #24536 (open) and three
+  merged PRs (#24517, #24520, #24558). A tester reports tpcds q72 1.42 s → 0.06 s and
+  tpch q18 0.67 s → 0.37 s.
+- The datafusion-distributed Iceberg provider reports table row counts and bytes, but
+  per-column statistics (min/max, nulls, NDV from Puffin) only with
+  `iceberg.column_stats_enabled=true` (default false). It accepts no pushed-down
+  filters, so join dynamic filters don't reach the Iceberg scan
+  (datafusion-contrib/datafusion-distributed#609).
+
+**Scope:**
+- **Engine variants:**
+  - `df-cs`: the `df` image with `iceberg.column_stats_enabled=true`.
+  - `df-jo`: dfrunner with #24456 (and what it needs from #24536) **backported onto
+    DataFusion 55.0.0**, so only the join-ordering code differs from `df`. Apply it
+    as a patch file in the repo (e.g. `dfrunner/patches/`), applied to a pinned
+    DataFusion 55.0.0 checkout during the Docker build; `[patch.crates-io]` points
+    the datafusion crates at it. If a backport turns out infeasible, stop and report
+    the options (e.g. building against the PR branch with the other dependencies
+    adapted) instead of picking one.
+  - `df-jo-cs`: `df-jo` with column statistics on.
+  - Each variant is a compose service with the same limits as `df`; engine names
+    map to the DataFusion dialect and overrides. `versions.lock.yaml` records the PR
+    head commit and the patch's hash. `run.json` records which variant ran.
+- **Plan** `plans/phase-l-a6-sf10.yaml`: all A1+A2 queries on `df-cs`, `df-jo`,
+  `df-jo-cs`, the SF10 run's protocol (cold per query, 5 hot, 600 s timeout).
+  Compared with `trino` and `df` from the SF10 run via `m0 compare` (same machine,
+  same data); if the comparison needs both baselines in one run, say so.
+- **Analysis:** per variant, outcomes (the five `err_mem` queries in particular),
+  geomean vs `trino` and `df`, regressions vs `df`, peak memory on join-heavy
+  queries. `m0 explain` the five queries on `df`, `df-jo-cs` and `trino` (build
+  side, rows into each join, whether the scan received a dynamic filter).
+- **Draft** `drafts/datafusion-24456-comment.md` (not posted): setup (Iceberg, a
+  4 GiB pool, no spill, Trino 484 as baseline), results table, and only the points
+  the data supports, e.g. statistics for filtered Iceberg scans, memory-aware build
+  sides, dynamic filters into the Iceberg scan, a pluggable cost model for
+  distributed exchanges.
+
+**Acceptance:**
+- All three variants run the SF10 plan to completion; every query has an outcome.
+- Answers diffed against Trino like any other engine.
+- A results table (outcomes, geomean, memory) and the draft comment, in the plan.
+
+**Risks:**
+- Backport conflicts with code that changed after 55.0.0 (statistics registry,
+  filter estimation).
+- The PR moves; pin the head commit and note it in the draft.
+
 ## Step 4b: investigation helpers
 
 **Carried over from 3b:**
@@ -582,8 +645,7 @@ on 2026-10-25.
   - task metrics exported for the A5 breakdown.
 - **Multi-node Trino** for A3: a coordinator plus a worker, the same total resources
   as `dfd`.
-- **Optimizer variant** `dfd-jo`: a build with apache/datafusion#24456 applied, with the
-  commit pinned (A6).
+- **Optimizer variant** `dfd-jo`: the step 4c backport on the distributed build (A6).
 - **B1 ETL query catalogue:** J1–J4, G1–G2, W1–W3, T1, S1–S2.
 - **B2:** memory levels 100/50/25% applied consistently across container, pool and
   Trino limits.
