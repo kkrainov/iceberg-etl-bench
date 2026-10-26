@@ -94,3 +94,11 @@ def test_real_manifest_is_the_full_catalogue():
         assert not q.ordered or q.sort_keys, f"{q.key}: ordered without sort_keys"
         if q.suite != "etl":
             assert "@" in q.source or q.source.startswith("TPC-"), q.key
+
+
+def test_tpch_q11_fraction_scales_with_sf():
+    q = queries.load_manifest()["tpch/q11"]
+    assert "* 0.0001\n" in queries.render(q, 1)
+    assert "* 0.00001" in queries.render(q, 10)
+    assert "* 0.0000001" in queries.render(q, 1000)
+    assert "${" not in queries.render(q, 10, "df")

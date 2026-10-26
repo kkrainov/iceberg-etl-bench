@@ -27,7 +27,7 @@ queries:
      source: "TPC-H v3.0.1 2.4.3, validation parameters"}
   - {suite: tpch, id: q04, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: 'string literal compared with o_orderdate written as a DATE literal (Trino has no implicit varchar-to-date cast)',
      source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q4.sql"}
-  - {suite: tpch, id: q05, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: null,
+  - {suite: tpch, id: q05, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: 'FRACTION is ${tpch_q11_fraction} = 0.0001 / SF (spec 2.4.11.3); the source has the SF1 value',
      source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q5.sql"}
   - {suite: tpch, id: q06, class: tpc, namespaces: [tpch], ordered: false, tie_ambiguous: false, rewrite: null,
      source: "TPC-H v3.0.1 2.4.6, validation parameters"}
@@ -39,7 +39,7 @@ queries:
      source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q9.sql"}
   - {suite: tpch, id: q10, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [3], tie_ambiguous: false, rewrite: null,
      source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q10.sql"}
-  - {suite: tpch, id: q11, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: 'FRACTION fixed at the SF1 value 0.0001 at every scale factor (spec: 0.0001 / SF)',
+  - {suite: tpch, id: q11, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [2], tie_ambiguous: false, rewrite: null,
      source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q11.sql"}
   - {suite: tpch, id: q12, class: tpc, namespaces: [tpch], ordered: true, sort_keys: [1], tie_ambiguous: false, rewrite: null,
      source: "apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q12.sql"}

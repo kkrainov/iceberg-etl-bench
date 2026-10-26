@@ -10,6 +10,7 @@ reason without a file, is an error.
 import re
 import string
 from dataclasses import dataclass
+from decimal import Decimal
 
 import yaml
 
@@ -22,6 +23,10 @@ OVERRIDES_DIR = QUERIES_DIR / "overrides"
 # SQL dialect family per engine; None = canonical (Trino) text.
 DIALECT = {"trino": None, "df": "datafusion", "dfd": "datafusion", "dfd-jo": "datafusion"}
 ID_RE = re.compile(r"[A-Za-z0-9_]+")
+# Query parameters that the spec scales with the scale factor, as `${name}` placeholders.
+SF_PARAMS = {
+    "tpch_q11_fraction": lambda sf: format(Decimal("0.0001") / Decimal(sf), "f"),  # TPC-H 2.4.11.3
+}
 
 
 class QueryError(Exception):
@@ -100,10 +105,11 @@ def render(q: Query, sf: int, engine: str | None = None) -> str:
     if not path.is_file():
         raise QueryError(f"missing SQL file {path}")
     text = path.read_text()
-    used = placeholders(text)
+    used = placeholders(text) - SF_PARAMS.keys()
     if used != set(q.namespaces):
         raise QueryError(f"{q.key}: SQL uses {sorted(used)}, manifest says {sorted(q.namespaces)}")
-    sql = string.Template(text).substitute({ns: f"{CATALOG}.{ns}_sf{sf}" for ns in NAMESPACES})
+    values = {ns: f"{CATALOG}.{ns}_sf{sf}" for ns in NAMESPACES} | {k: f(sf) for k, f in SF_PARAMS.items()}
+    sql = string.Template(text).substitute(values)
     # Strip comment-only lines and the trailing semicolon: one statement per file.
     lines = [line for line in sql.splitlines() if not line.lstrip().startswith("--")]
     return "\n".join(lines).strip().rstrip(";")
