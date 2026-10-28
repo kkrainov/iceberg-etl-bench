@@ -18,7 +18,7 @@ GIB = 1024**3
 MIN_KERNEL_FOR_PEAK_RESET = (6, 12)
 MIN_DISK_GIB, WARN_DISK_GIB = 20, 50
 MIN_MEM_GIB, WARN_MEM_GIB = 6, 10
-STACK_PORTS = {8080: "trino", 8181: "catalog", 8333: "objstore", 9000: "df"}
+STACK_PORTS = {8080: "trino", 8181: "catalog", 8333: "objstore", 9000: "df and its variants"}
 
 # Recommended .wslconfig values for benchmark runs (docs/infrastructure.md).
 WSL_MIN_MEMORY_GIB = 11

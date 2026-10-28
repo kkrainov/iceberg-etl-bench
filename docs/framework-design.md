@@ -81,8 +81,8 @@ Rules every command follows:
 | `m0 run <plan.yaml> [--engine E] [--query Q] [--resume] [--run-id ID]` | Executes the plan's cells (or those matching `--engine`/`--query`, both repeatable) into `results/<run-id>/`. Prints only non-`ok` cells and restarts as they happen, then outcome counts per engine. An existing run ID needs `--resume` (exit code 4 otherwise, also if the plan file changed); `--resume` without `--run-id` continues the latest run of that plan. |
 | `m0 status [<run-id>\|latest]` | Progress, outcome counts, and the last failure in one line |
 | `m0 results list\|prune [--keep ID] [--yes]` | Lists runs under `results/`; `prune` deletes runs not named in `results/keep.txt` or `--keep` (dry run without `--yes`). See [Results](#results). |
-| `m0 summarize [<run-id>\|latest]` | At most 40 lines: outcome counts per engine (a completed cell whose answer differs from Trino's shows as `ok_mismatch`), answer diffs per engine with the normalisations used, suite totals over common queries with ratio and geomean [95% CI], top 10 slowest relative queries, non-`ok` cells grouped by engine, outcome and error signature, every answer mismatch. Sections are capped and say what `--json` has (everything). Exit code 3 if any cell is not `ok`. See [Analysis](#analysis). |
-| `m0 compare <run-a> <run-b>` | Before/after comparison per engine, e.g. a new upstream version or `dfd-jo` vs `dfd`: totals and geomean of B/A over queries both runs completed, queries that moved beyond noise, outcome changes, changed images and config files |
+| `m0 summarize [<run-id>\|latest] [--with RUN]…` | `--with` adds the engines of another run (e.g. the `trino` and `df` baseline of an earlier run on the same machine and data); an engine may come from one run only. At most 40 lines: outcome counts per engine (a completed cell whose answer differs from Trino's shows as `ok_mismatch`), answer diffs per engine with the normalisations used, suite totals over common queries with ratio and geomean [95% CI], top 10 slowest relative queries, non-`ok` cells grouped by engine, outcome and error signature, every answer mismatch. Sections are capped and say what `--json` has (everything). Exit code 3 if any cell is not `ok`. See [Analysis](#analysis). |
+| `m0 compare <run-a> <run-b> [--engines A:B]…` | Before/after comparison per engine, e.g. a new upstream version; `--engines df:df-jo` compares engine `df` of run A with `df-jo` of run B (A and B may be the same run): totals and geomean of B/A over queries both runs completed, queries that moved beyond noise, outcome changes, changed images and config files |
 | `m0 explain <run-id> <engine> <query> [--top N] [--timeout S]` | Re-runs one query on the live engine with the run's scale factor and SQL: Trino `EXPLAIN ANALYZE` plus `/v1/query/{id}` operator summaries; `df` runs the query and reads dfrunner's plan with metrics. Saves `diag/explain.<engine>.<suite>.<id>/{query.sql, plan.txt, operators.json, stats.json}`, prints the top operators by time. Exit code 2 if the engine isn't up. |
 | `m0 logs <run-id> <engine> <query> [--grep P] [--tail N]` | `docker logs` of the engine container for each round's window of that query's cells (`started_at` to the end of the last cell, plus a few seconds). Says when the container was recreated since and the lines are gone (exit code 2 if all are). |
 | `m0 triage <run-id>` | Best-effort grouping of non-`ok` cells and harness errors by signature (outcome, engine, normalised error). Prints each group with paths to its logs, memory timeline and plan. Errors no rule recognises are grouped as `unrecognised` for the agent to look at. |
@@ -269,7 +269,7 @@ m0-bench/
 ├── pyproject.toml  uv.lock          # Python deps: trino, pyyaml (matplotlib with the report)
 ├── versions.lock.yaml               # Trino image digest, DataFusion/datafusion-distributed/iceberg-rust revs, Lakekeeper, SeaweedFS, JDK
 ├── m0/                              # Python package: cli, plan, queries, engines/, metrics, classify (+ classify_rules.yaml), runner, store, differ, stats, analysis, explain, logs, report
-├── dfrunner/                        # Rust crate: Cargo.toml, Cargo.lock, src/
+├── dfrunner/                        # Rust crate: Cargo.toml, Cargo.lock, src/, patches/ (build variants)
 ├── queries/
 │   ├── manifest.yaml                # id, suite, class, ordered, tie_ambiguous, rewrite reasons
 │   ├── tpch/  tpcds/  etl/          # canonical SQL (Trino dialect)
@@ -290,13 +290,14 @@ m0-bench/
 `dfrunner/` (Rust, ~700 lines) serves one long-lived `SessionContext` over HTTP on
 `127.0.0.1:9000`. Configuration: `configs/datafusion/local/dfrunner.properties`
 (`dfrunner.*`, `catalog.*`, `s3.*`, and any `datafusion.*`/`iceberg.*` session option,
-each with its reason), S3 credentials from `AWS_*` variables. `dfrunner healthcheck`
-is the container health check.
+each with its reason), optionally a second file whose keys win (`DFRUNNER_CONFIG_EXTRA`,
+used by the `-cs` variants), S3 credentials from `AWS_*` variables. `dfrunner
+healthcheck` is the container health check.
 
 | Endpoint | Does |
 |---|---|
 | `GET /health` | 200 once the catalog is connected (startup waits up to 60 s for it) |
-| `GET /status` | Versions compiled in (DataFusion, datafusion-distributed, iceberg-rust, datafusion-iceberg; from `Cargo.lock`), settings (file, applied session options, `target_partitions`, pool kind and limit, disk manager, catalog), pool `limit`/`reserved`/`peak`, namespaces (re-listed), running query IDs |
+| `GET /status` | Versions compiled in (DataFusion, datafusion-distributed, iceberg-rust, datafusion-iceberg; from `Cargo.lock`) and the build `variant` with its detail, settings (file, applied session options, `target_partitions`, pool kind and limit, disk manager, catalog, the physical optimizer rule names in order, the join-related optimizer options), pool `limit`/`reserved`/`peak`, namespaces (re-listed), running query IDs |
 | `POST /query` `{"sql", "query_id"}` | Plans and executes read-only SQL (DDL, DML and `SET` rejected), collects every batch, returns 200 with `{"columns": [{name, type}], "rows": [[…]]}` (canonical JSON values, see [Results](#results)) plus `x-dfrunner-{query-id,elapsed-ms,pool-peak-bytes,rows}` headers. On failure: 422 `{"query_id", "error": {variant, contexts, root_message, message}}`, where `variant` is the root `DataFusionError` variant (`ResourcesExhausted`, `NotImplemented`, `Plan`, `SQL`, `Execution`, …, or `Cancelled`) and `contexts` the context labels on the way (e.g. `IcebergError(FeatureUnsupported)`). 409 if the ID is already running. |
 | `GET /queries/{id}` | Final stats of one of the last 512 queries: `elapsed_ms`, `planning_ms`, `execution_ms`, `process_cpu_s` (getrusage delta), `rows`, `pool {limit, at_start, peak, at_end}`, `error`, and `metrics {operators: [{depth, op, metrics}], plan}` (physical plan with metrics). 202 while running. |
 | `DELETE /queries/{id}` | Cancel: aborts the query's task. A client that disconnects also aborts it. |
@@ -319,6 +320,46 @@ is the container health check.
   `to_json`, `m0/engines/base.py` `canonical`; table in [Results](#results)), so the
   two engines' answers compare as JSON. Column types are each engine's own names
   (Arrow type names here).
+
+### Engine variants (step 4c)
+
+Single-node DataFusion variants for suite A6 (methodology section 2). Each is a compose
+service with `df`'s limits, port and base config, and its own engine name in the
+harness (`m0/engines/df.py` `VARIANTS`; the DataFusion dialect, overrides and error rules
+apply to all). Only one runs at a time.
+
+| Engine | Image (build variant) | Extra config |
+|---|---|---|
+| `df` | `m0-dfrunner:local` (`df`) | none |
+| `df-cs` | `m0-dfrunner:local` (`df`) | `column-stats.properties`: `iceberg.column_stats_enabled=true` |
+| `df-jo` | `m0-dfrunner-jo:local` (`jo`) | none |
+| `df-jo-cs` | `m0-dfrunner-jo:local` (`jo`) | `column-stats.properties` |
+| `df-sail` | `m0-dfrunner-sail:local` (`sail`) | none |
+| `df-sail-cs` | `m0-dfrunner-sail:local` (`sail`) | `column-stats.properties` |
+
+How each build variant is made (`dfrunner/Dockerfile`, `ARG DFRUNNER_VARIANT`, which runs
+`dfrunner/patches/prepare.sh`; one cargo target cache per variant):
+- `df`: plain dfrunner, DataFusion 55.0.0 from crates.io.
+- `jo`: apache/datafusion#24456 (cost-based join order enumeration) backported onto
+  55.0.0. `prepare.sh` downloads the crates.io 55.0.0 sources of datafusion-common,
+  datafusion-physical-optimizer and datafusion-physical-plan, checks them against the
+  checksums in `Cargo.lock`, applies `patches/datafusion-55.0.0-pr24456.patch` (its
+  header lists what was taken and every adaptation), appends
+  `patches/jo.cargo-patch.toml` (`[patch.crates-io]` to those paths) and builds with
+  `patches/jo.Cargo.lock` (the `df` lockfile with those three crates as path
+  dependencies). The PR's `datafusion.optimizer.join_enumeration` defaults to true and is
+  left so. `versions.lock.yaml` pins the PR head, its merge base and the patch hash.
+- `sail`: cargo feature `sail-join-reorder` compiles `src/sail_join_reorder/` (Sail's
+  `JoinReorder` rule, lakehq/sail pinned in `versions.lock.yaml`), which `main.rs` inserts
+  just before `JoinSelection` in DataFusion's default physical rule list, with default
+  `JoinReorderOptions`. Sail's other physical rules are not added.
+
+`m0 env up --engine <variant>` builds the image through the service that builds it
+(`df`, `df-jo`, `df-sail`) and starts the variant. `run.json` records the variant through
+`/status` (`versions.variant`, `versions.variant_detail`, the rule list and the session
+options) and hashes its config and build files. datafusion-distributed's own physical
+rules are not used in single mode, and its Iceberg provider registers no optimizer rules,
+so every variant reads the same tables through the same provider.
 
 ## Run plans
 
@@ -512,6 +553,8 @@ file keeps its licence header plus a `Derived from <repo>@<sha>:<path>` line, an
 | datafusion-distributed `iceberg/` | Catalog-backed table provider usage (as a library dependency) | `dfrunner/` |
 | datafusion-distributed `benchmarks/src/{run,stats,compare}.rs` | Iteration and comparison logic, as a reference for the Python port | `m0/stats.py` |
 | apache/datafusion `benchmarks/queries` | TPC-H/TPC-DS query text known to plan in DataFusion | `queries/` (Trino variants are canonical) |
+| apache/datafusion#24456 (unmerged PR, pinned head) | Cost-based join order enumeration, backported to 55.0.0 as a patch applied at build time | `dfrunner/patches/` (variant `jo`) |
+| lakehq/sail `crates/sail-physical-optimizer/src/join_reorder/` | `JoinReorder` physical optimizer rule | `dfrunner/src/sail_join_reorder/` (variant `sail`) |
 | trinodb/trino `tpcds`/`tpch` connectors and benchmark queries | Data generation via CTAS; Trino query text | `datagen/`, `queries/` |
 | ClickHouse/ClickBench | Run-script structure only. Its Trino timing method (CLI JVM startup counted in each query) is a known flaw we avoid. | — |
 | gabotechs/datafusion-distributed-dev-tools | Reference for remote cluster layout and the Trino config they used (we document how ours differs) | `docs/` |

@@ -27,8 +27,18 @@
    - waits for the health check (`dfrunner healthcheck` → `GET /health`), then reads
      `iceberg.tpch_sf1.region` through the catalog (read-only smoke test).
 
-`m0 env up --engine trino` stops `df` again, and `m0 run` switches between engines by
-itself (stop one, recreate the other).
+6. With a step 4c variant (`--engine df-cs`, `df-jo`, `df-jo-cs`, `df-sail`, `df-sail-cs`):
+   the same as `df`, except that it builds the variant's image through the service that
+   owns it (`df` for `df-cs`, `df-jo` for `df-jo-cs`, `df-sail` for `df-sail-cs`;
+   images `m0-dfrunner:local`, `m0-dfrunner-jo:local`, `m0-dfrunner-sail:local`) and
+   starts the variant's own service on the same port 9000. The `jo` build downloads
+   three DataFusion 55.0.0 crates from crates.io and applies
+   `dfrunner/patches/datafusion-55.0.0-pr24456.patch` (`dfrunner/patches/prepare.sh`).
+   `curl -s 127.0.0.1:9000/status` shows `versions.variant` and the physical optimizer
+   rules in `settings.physical_optimizer_rules`.
+
+`m0 env up --engine trino` stops `df` (and every variant) again, and `m0 run` switches
+between engines by itself (stop one, recreate the other).
 
 **Storage access is client-managed.** Lakekeeper vends no credentials. Every engine
 uses the same static local S3 credentials, which mirrors IAM-role access on AWS.
@@ -51,7 +61,7 @@ Data lives in Docker volumes `m0_objstore-data` and `m0_catalog-db-data`.
 | Trino `has been replaced. Use … instead` in logs | `grep "has been replaced"` | Property renamed in this Trino version; update the config |
 | Trino OOM-killed (container exit status 137 in `ps --all`) | `docker inspect m0-trino-1 --format '{{.State.OOMKilled}}'` | Container memory limit too small for the heap (80% of the limit) plus native memory |
 | Port already allocated | `m0 doctor` port checks | Another process holds 8080, 8181, 8333 or 9000 |
-| `docker compose build df failed` | the error tail in the message; `docker compose -p m0 build df --progress plain 2>&1 \| grep -E "^#.*(error\|warning)" \| head` | Rust compile error (fix `dfrunner/src`), a git dependency that can't be fetched (network), or `--locked` refusing a stale `Cargo.lock` (run `cargo update -p <crate> --precise <version>` on the host, never a bare `cargo update`) |
+| `docker compose build df failed` (or `df-jo`, `df-sail`) | the error tail in the message; `docker compose -p m0 build df --progress plain 2>&1 \| grep -E "^#.*(error\|warning)" \| head` | Rust compile error (fix `dfrunner/src`; for `df-jo` a patch that no longer applies or compiles: `dfrunner/patches/`), a git dependency that can't be fetched (network), or `--locked` refusing a stale `Cargo.lock` (run `cargo update -p <crate> --precise <version>` on the host, never a bare `cargo update`) |
 | Build killed or the host freezes during the build | `free -m`, `dmesg \| tail` (may need the user) | Linking DataFusion with thin LTO needs ~4 GiB. Stop engines first (`m0 env up` without `--engine` stops them); `--engine df` does this itself. |
 | `df` unhealthy after `up` | `docker compose -p m0 logs df --tail 50` | Config error (the log names the key), or the catalog wasn't reachable within `catalog.startup_wait_s` |
 | `dfrunner smoke test failed` | `curl -s 127.0.0.1:9000/status`, `docker compose -p m0 logs df \| grep -E "ERROR\|WARN" \| tail` | Catalog error (`namespaces` shows it) or S3: wrong endpoint, credentials or path style; compare with `configs/trino/local/catalog/iceberg.properties` |

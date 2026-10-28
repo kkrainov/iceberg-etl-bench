@@ -27,6 +27,17 @@ engines:
   iceberg_rust: "0.10.1@5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3"        # incl. iceberg-catalog-rest
   datafusion_iceberg: "0.12.0@20327db58c7a44330366da00a34a26e866d0da4d"  # apache/datafusion-iceberg
   arrow: "59.3.0"
+  # Step 4c engine variants (methodology section 2). dfrunner/patches/prepare.sh builds them.
+  # jo (df-jo, df-jo-cs): apache/datafusion#24456 backported onto 55.0.0 as a patch to the
+  # crates.io 55.0.0 sources of datafusion-common, -physical-optimizer, -physical-plan.
+  datafusion_pr24456:
+    head: "472e83e1289eec0b482a5b3d4d0dc1f5140fe878"        # Dandandan/datafusion perf/join-order-enumeration
+    merge_base: "242b96c231636b5738125678a83197896a5cc64b"  # apache/datafusion main, 2026-10-01
+    patch: dfrunner/patches/datafusion-55.0.0-pr24456.patch
+    patch_sha256: "535984dc9768f690b38a5eff8c5da8c1f859522480f851315f1df80f7aab305c"
+    lockfile_sha256: "6eaa72078de1acef36c7834f6ff230f94c42b6e5c2a385e713dd6a1a3aac59ad"                              # dfrunner/patches/jo.Cargo.lock
+  # sail (df-sail, df-sail-cs): Sail's JoinReorder rule, copied into dfrunner/src/sail_join_reorder/.
+  sail: "86dea385943c785b38d85479755589d193f989d3"            # lakehq/sail main, 2026-10-26 (module last changed at 36431029)
   rust: "1.95.0"
 
 tools:

@@ -155,3 +155,56 @@ def test_logs_grep_and_tail(run, monkeypatch):
     monkeypatch.setattr(logs, "docker_logs", lambda cid, a, b: ["t1 Query q-1 started", "t2 other", "t3 Query q-1 x"])
     r = logs.collect(run.rows(), "df", "df", q, "query q-1", 1)
     assert r["matched"] == 4 and r["lines"] == ["t3 Query q-1 x"]
+
+
+def variant_run(src: RunStore, root, run_id: str, rename: dict[str, str]) -> RunStore:
+    """A run holding only `src`'s engines in `rename`, under their new names."""
+    s = RunStore(run_id, root)
+    s.write_run({**src.read_run(), "run_id": run_id})
+    for r in src.rows():
+        if r["engine"] in rename:
+            s.append({**r, "engine": rename[r["engine"]], "cell_id": r["cell_id"].replace(r["engine"], rename[r["engine"]], 1)})
+    for a in src.answers():
+        if a["engine"] in rename:
+            row = {"cell_id": a["cell_id"], "engine": rename[a["engine"]], "suite": a["suite"], "query_id": a["query_id"]}
+            s.write_answer(row, [(c["name"], c["type"]) for c in a["columns"]], a["rows"], 100)
+    return s
+
+
+def test_summarize_with_baseline_run_adds_its_engines(tmp_path):
+    base = fake_run(tmp_path, "base", seed=1)
+    var = variant_run(fake_run(tmp_path, "src", fail_every=5, seed=2), tmp_path, "var", {"df": "df-jo"})
+    s = analysis.summarize(var, others=[base])
+    assert s["engines"] == ["trino", "df", "df-jo"]
+    assert s["merged"][0]["run_id"] == "base" and s["merged"][0]["engines"] == ["df", "trino"]
+    assert {d["engine"] for d in s["diffs"]} == {"df", "df-jo"}  # df-jo answers diffed against base's trino
+    assert any(su["geomean"].get("df-jo") for su in s["suites"])
+    lines = analysis.render_summary(s)
+    assert len(lines) <= analysis.MAX_LINES and "from run base" in lines[1]
+    with pytest.raises(analysis.MergeError):
+        analysis.summarize(base, others=[fake_run(tmp_path, "dup", seed=3)])
+
+
+def test_compare_engine_pairs_across_runs(tmp_path):
+    base = fake_run(tmp_path, "base", seed=1)
+    var = variant_run(fake_run(tmp_path, "src", fail_every=5, seed=2), tmp_path, "var", {"df": "df-jo"})
+    c = analysis.compare(base, var, pairs=[("df", "df-jo"), ("trino", "df-jo")])
+    assert set(c["engines"]) == {"df:df-jo", "trino:df-jo"}
+    x = c["engines"]["df:df-jo"]
+    assert x["engine_a"] == "df" and x["engine_b"] == "df-jo" and x["completed_both"]
+    assert x["ratio_total"] == pytest.approx(1, rel=0.1) and x["outcome_changes"]
+    assert c["engines"]["trino:df-jo"]["ratio_total"] < 1  # df-jo is faster than trino here
+    assert len(analysis.render_compare(c)) <= analysis.MAX_LINES
+    assert analysis.compare(base, var)["engines"] == {}  # no engine in common
+
+
+def test_cli_summarize_with_and_compare_engines(tmp_path, monkeypatch, capsys):
+    fake_run(tmp_path, "base", seed=1)
+    variant_run(fake_run(tmp_path, "src", seed=2), tmp_path, "var", {"df": "df-cs"})
+    monkeypatch.setattr(cli, "find_run", lambda r: RunStore(r, tmp_path) if (tmp_path / r).is_dir() else None)
+    assert cli.main(["summarize", "var", "--with", "base"]) in (Exit.OK, Exit.QUERIES_FAILED)
+    assert "df-cs" in capsys.readouterr().out
+    assert cli.main(["summarize", "base", "--with", "src"]) == Exit.PREREQUISITE  # engines in both
+    assert cli.main(["compare", "base", "var", "--engines", "df:df-cs"]) == Exit.OK
+    assert "df:df-cs" in capsys.readouterr().out
+    assert cli.main(["compare", "base", "var", "--engines", "df"]) == Exit.PREREQUISITE

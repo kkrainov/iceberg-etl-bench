@@ -12,10 +12,11 @@ import urllib.error
 import urllib.request
 
 from m0 import versions
+from m0.engines import DF_ENGINES
 from m0.output import FAIL, OK, WARN, Check
 from m0.paths import LOCAL_COMPOSE
 
-ENGINES = ("trino", "df")
+ENGINES = ("trino", *DF_ENGINES)
 DFRUNNER_URL = "http://127.0.0.1:9000"
 BUILD_TIMEOUT_S = 3600
 INFRA_SERVICES = ("objstore", "catalog-db", "catalog-migrate", "catalog")
@@ -153,18 +154,24 @@ def trino_smoke(timeout_s: float = 180) -> str:
     raise EnvError(f"Trino smoke test failed: {last_error}")
 
 
-def build_engine(engine: str) -> float:
-    """Build a locally built engine image (dfrunner); incremental thanks to cache mounts."""
+def build_engine(engine: str) -> tuple[str, float]:
+    """Build a locally built engine image (dfrunner); incremental thanks to cache mounts.
+
+    A `-cs` variant uses the image of its base service, which is the one built.
+    Returns (service built, seconds)."""
+    from m0.engines.df import VARIANTS
+
+    service = VARIANTS[engine].build_service
     start = time.monotonic()
-    compose("build", engine, timeout=BUILD_TIMEOUT_S)
-    return time.monotonic() - start
+    compose("build", service, timeout=BUILD_TIMEOUT_S)
+    return service, time.monotonic() - start
 
 
-def df_smoke(timeout_s: float = 120) -> str:
+def df_smoke(engine: str = "df", timeout_s: float = 120) -> str:
     """Read-only end-to-end check: dfrunner -> REST catalog -> object store."""
     from m0.engines.df import DfEngine
 
-    eng = DfEngine()
+    eng = DfEngine(engine)
     deadline = time.monotonic() + timeout_s
     last = None
     while time.monotonic() < deadline:
@@ -174,7 +181,8 @@ def df_smoke(timeout_s: float = 120) -> str:
                 if "tpch_sf1" in status["namespaces"] else eng.execute("SELECT 1", timeout_s=60)
             if res.completed:
                 v = status.get("versions", {})
-                return (f"DataFusion {v.get('datafusion')}, {len(status['namespaces'])} namespaces, "
+                return (f"DataFusion {v.get('datafusion')} ({v.get('variant', 'df')} build), "
+                        f"{len(status['namespaces'])} namespaces, "
                         f"pool {status['pool']['limit'] / 2**30:.0f} GiB; read through catalog ok")
             last = res.error.message if res.error else res.client_error
         elif status:
@@ -205,7 +213,7 @@ def up(engine: str | None, engine_mem: str, engine_cpus: str) -> list[Check]:
         if others:
             compose("stop", *others)
         built = None
-        if engine == "df":
+        if engine in DF_ENGINES:
             # Engines are stopped first: a release build of DataFusion needs several GiB.
             built = build_engine(engine)
         # Always recreate: picks up config edits and guarantees a cold engine.
@@ -213,9 +221,9 @@ def up(engine: str | None, engine_mem: str, engine_cpus: str) -> list[Check]:
     checks = [Check("bucket", OK, ensure_bucket()), Check("catalog", OK, ensure_catalog())]
     if engine == "trino":
         checks.append(Check("trino", OK, trino_smoke()))
-    elif engine == "df":
-        checks.append(Check("df.build", OK, f"image m0-dfrunner:local up to date ({built:.0f}s)"))
-        checks.append(Check("df", OK, df_smoke()))
+    elif engine in DF_ENGINES:
+        checks.append(Check(f"{engine}.build", OK, f"image of service {built[0]} up to date ({built[1]:.0f}s)"))
+        checks.append(Check(engine, OK, df_smoke(engine)))
     return checks + status_checks()
 
 

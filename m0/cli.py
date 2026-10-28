@@ -365,7 +365,17 @@ def cmd_summarize(args: argparse.Namespace) -> Exit:
     s = find_run(args.run)
     if s is None:
         return no_run("summarize", args.run, args.json)
-    summary = analysis.summarize(s)
+    others = []
+    for run_id in args.with_run or []:
+        o = find_run(run_id)
+        if o is None:
+            return no_run("summarize", run_id, args.json)
+        others.append(o)
+    try:
+        summary = analysis.summarize(s, others=others)
+    except analysis.MergeError as e:
+        print_checks([Check("summarize", FAIL, str(e))], args.json)
+        return Exit.PREREQUISITE
     if args.json:
         print(json.dumps(summary, indent=1, default=str))
     else:
@@ -380,7 +390,16 @@ def cmd_compare(args: argparse.Namespace) -> Exit:
     a, b = find_run(args.run_a), find_run(args.run_b)
     if a is None or b is None:
         return no_run("compare", args.run_a if a is None else args.run_b, args.json)
-    c = analysis.compare(a, b)
+    pairs = None
+    if args.engines:
+        pairs = []
+        for spec in args.engines:
+            ea, sep, eb = spec.partition(":")
+            if not sep or not ea or not eb:
+                print_checks([Check("compare", FAIL, f"--engines {spec!r}: expected ENGINE_A:ENGINE_B")], args.json)
+                return Exit.PREREQUISITE
+            pairs.append((ea, eb))
+    c = analysis.compare(a, b, pairs=pairs)
     if args.json:
         print(json.dumps(c, indent=1, default=str))
     else:
@@ -482,11 +501,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("summarize", parents=[common],
                        help="outcomes, answer diffs, suite totals and ratios, slowest queries, failures of a run")
     p.add_argument("run", nargs="?", default="latest", help="run ID or latest (default)")
+    p.add_argument("--with", dest="with_run", action="append", metavar="RUN",
+                   help="also include the engines of this run (repeatable; e.g. the trino and df baseline of "
+                        "an earlier run on the same machine and data); an engine may come from one run only")
     p.set_defaults(func=cmd_summarize)
 
     p = sub.add_parser("compare", parents=[common], help="run B against run A per engine and query (B/A times)")
     p.add_argument("run_a", help="run ID (before), or latest")
     p.add_argument("run_b", help="run ID (after), or latest")
+    p.add_argument("--engines", action="append", metavar="A:B",
+                   help="compare engine A of run_a with engine B of run_b (repeatable; e.g. df:df-jo); "
+                        "default: each engine both runs have with itself")
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("explain", parents=[common],

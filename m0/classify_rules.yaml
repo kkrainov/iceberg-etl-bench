@@ -35,32 +35,32 @@ rules:
     outcome: err_other
     error_name: (TABLE|SCHEMA|CATALOG|COLUMN)_NOT_FOUND
 
-  # ---- DataFusion (df; dfd from step 5) ----
+  # ---- DataFusion (df and its step 4c variants; dfd from step 5) ----
   - id: df.memory_limit
-    engine: [df, dfd, dfd-jo]
+    engine: [df, df-cs, df-jo, df-jo-cs, df-sail, df-sail-cs, dfd, dfd-jo]
     outcome: err_mem
     error_name: ResourcesExhausted
   - id: df.not_implemented
-    engine: [df, dfd, dfd-jo]
+    engine: [df, df-cs, df-jo, df-jo-cs, df-sail, df-sail-cs, dfd, dfd-jo]
     outcome: err_unsupported
     error_name: NotImplemented
   - id: df.syntax
-    engine: [df, dfd, dfd-jo]
+    engine: [df, df-cs, df-jo, df-jo-cs, df-sail, df-sail-cs, dfd, dfd-jo]
     outcome: err_unsupported
     error_name: SQL
   - id: df.iceberg_unsupported
-    engine: [df, dfd, dfd-jo]
+    engine: [df, df-cs, df-jo, df-jo-cs, df-sail, df-sail-cs, dfd, dfd-jo]
     outcome: err_unsupported
     error_type: IcebergError\(FeatureUnsupported\)
   # Plan errors: a missing table is not a missing feature; an unknown function or an
   # unsupported construct is.
   - id: df.missing_object
-    engine: [df, dfd, dfd-jo]
+    engine: [df, df-cs, df-jo, df-jo-cs, df-sail, df-sail-cs, dfd, dfd-jo]
     outcome: err_other
     error_name: Plan
     message: "table '[^']+' not found|[Ss]chema .* not found|No field named"
   - id: df.unsupported_plan
-    engine: [df, dfd, dfd-jo]
+    engine: [df, df-cs, df-jo, df-jo-cs, df-sail, df-sail-cs, dfd, dfd-jo]
     outcome: err_unsupported
     error_name: Plan
     message: "Invalid function|[Nn]ot supported|[Uu]nsupported"

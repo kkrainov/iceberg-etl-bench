@@ -2,6 +2,7 @@
 
 import datetime as dt
 from decimal import Decimal
+from pathlib import Path
 
 from m0.engines.base import ExecResult, canonical
 from m0.engines.df import DfEngine, engine_error, operator_time, parse_bytes
@@ -134,3 +135,60 @@ def test_exec_result_completed():
     r = ExecResult(wall_ms=1.0, rows=[[1, "x"], [2, "y"]])
     assert r.completed and r.row_count == 2
     assert ExecResult(wall_ms=None).completed is False and ExecResult(wall_ms=None).row_count is None
+
+
+def test_variants_are_wired_everywhere():
+    """Every DataFusion variant has an adapter, a compose service, the DataFusion dialect,
+    the DataFusion error rules and a plan engine name."""
+    import yaml
+
+    from m0 import engines, env_local, plan
+    from m0.engines.df import VARIANTS
+    from m0.paths import LOCAL_COMPOSE
+    from m0.queries import DIALECT
+
+    assert set(VARIANTS) == set(engines.DF_ENGINES)
+    services = yaml.safe_load(LOCAL_COMPOSE.read_text())["services"]
+    rules = yaml.safe_load((Path(__file__).parents[1] / "m0" / "classify_rules.yaml").read_text())["rules"]
+    for name, v in VARIANTS.items():
+        eng = engines.get(name)
+        assert (eng.name, eng.service) == (name, name)
+        assert name in env_local.ENGINES and name in plan.ENGINES and DIALECT[name] == "datafusion"
+        svc = services[name]
+        assert svc["profiles"] == [name] and svc["ports"] == ["127.0.0.1:9000:9000"]
+        assert svc["image"] == services[v.build_service]["image"]
+        assert services[v.build_service]["build"]["args"]["DFRUNNER_VARIANT"] == v.build
+        assert ("DFRUNNER_CONFIG_EXTRA" in svc["environment"]) == v.column_stats
+        assert all(name in r["engine"] for r in rules if r["id"].startswith("df."))
+        assert all(p.is_file() for p in eng.config_files())
+
+
+def test_cs_variants_add_only_column_stats():
+    from m0.engines.df import CS_CONFIG_FILE, DfEngine, read_properties
+
+    assert read_properties(CS_CONFIG_FILE) == {"iceberg.column_stats_enabled": "true"}
+    assert set(DfEngine("df-jo-cs").config_files()) - set(DfEngine("df-jo").config_files()) == {CS_CONFIG_FILE}
+
+
+def test_versions_lock_pins_the_jo_patch():
+    import hashlib
+
+    from m0 import versions
+    from m0.paths import REPO_ROOT
+
+    pr = versions.load()["engines"]["datafusion_pr24456"]
+    for key, path in (("patch_sha256", pr["patch"]), ("lockfile_sha256", "dfrunner/patches/jo.Cargo.lock")):
+        assert hashlib.sha256((REPO_ROOT / path).read_bytes()).hexdigest() == pr[key], path
+
+
+def test_describe_only_its_own_container(monkeypatch):
+    """All variants share port 9000: a variant whose container isn't running must not
+    record the running variant's versions and settings in run.json."""
+    from m0 import env_local
+
+    eng = DfEngine("df-jo")
+    monkeypatch.setattr(env_local, "container_state", lambda svc: {"running": svc == "df-sail"})
+    monkeypatch.setattr(eng, "status", lambda: {"mode": "single", "versions": {"variant": "sail"}})
+    assert "error" in eng.describe()
+    monkeypatch.setattr(env_local, "container_state", lambda svc: {"running": svc == "df-jo"})
+    assert eng.describe()["versions"] == {"variant": "sail"}

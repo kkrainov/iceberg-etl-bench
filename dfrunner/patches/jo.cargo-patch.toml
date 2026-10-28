@@ -1,0 +1,6 @@
+
+# Appended to Cargo.toml by patches/prepare.sh for the `jo` variant only.
+[patch.crates-io]
+datafusion-common = { path = "/opt/datafusion-55.0.0/datafusion/common" }
+datafusion-physical-optimizer = { path = "/opt/datafusion-55.0.0/datafusion/physical-optimizer" }
+datafusion-physical-plan = { path = "/opt/datafusion-55.0.0/datafusion/physical-plan" }

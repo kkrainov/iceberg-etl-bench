@@ -17,11 +17,14 @@
 //!
 //! Usage: `dfrunner [single]` (serve; `node` arrives in step 5) or `dfrunner healthcheck`.
 //! Configuration: a properties file (`DFRUNNER_CONFIG`, default
-//! /etc/dfrunner/dfrunner.properties) plus S3 credentials from AWS_* variables.
+//! /etc/dfrunner/dfrunner.properties), optionally a second one whose keys win
+//! (`DFRUNNER_CONFIG_EXTRA`), plus S3 credentials from AWS_* variables.
 
 mod catalog;
 mod pool;
 mod query;
+#[cfg(feature = "sail-join-reorder")]
+mod sail_join_reorder;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
@@ -61,10 +64,20 @@ struct Config {
 }
 
 impl Config {
+    /// `DFRUNNER_CONFIG`, then `DFRUNNER_CONFIG_EXTRA` if set (an engine variant's few
+    /// extra keys, e.g. column statistics on); a key in the extra file wins.
     fn load() -> Result<Self, Box<dyn Error>> {
         let path = std::env::var("DFRUNNER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.into());
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("config {path}: {e}"))?;
         let mut props = BTreeMap::new();
+        Self::read_into(&path, &mut props)?;
+        if let Ok(extra) = std::env::var("DFRUNNER_CONFIG_EXTRA") {
+            Self::read_into(&extra, &mut props)?;
+        }
+        Ok(Self { props })
+    }
+
+    fn read_into(path: &str, props: &mut BTreeMap<String, String>) -> Result<(), Box<dyn Error>> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("config {path}: {e}"))?;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -73,7 +86,7 @@ impl Config {
             let (k, v) = line.split_once('=').ok_or(format!("bad config line: {line}"))?;
             props.insert(k.trim().to_string(), v.trim().to_string());
         }
-        Ok(Self { props })
+        Ok(())
     }
 
     fn get(&self, key: &str) -> Option<&str> {
@@ -99,6 +112,9 @@ fn parse_bytes(s: &str) -> Result<usize, String> {
 #[derive(Serialize, Clone)]
 struct Versions {
     dfrunner: &'static str,
+    /// Build variant (`df`, `jo`, `sail`) and what it changes; see dfrunner/Dockerfile.
+    variant: &'static str,
+    variant_detail: &'static str,
     datafusion: &'static str,
     datafusion_distributed: &'static str,
     iceberg_rust: &'static str,
@@ -107,6 +123,8 @@ struct Versions {
 
 const VERSIONS: Versions = Versions {
     dfrunner: env!("CARGO_PKG_VERSION"),
+    variant: env!("DFRUNNER_VARIANT"),
+    variant_detail: env!("DFRUNNER_VARIANT_DETAIL"),
     datafusion: env!("DFRUNNER_DEP_DATAFUSION"),
     datafusion_distributed: env!("DFRUNNER_DEP_DATAFUSION_DISTRIBUTED"),
     iceberg_rust: env!("DFRUNNER_DEP_ICEBERG"),
@@ -194,11 +212,14 @@ async fn serve() -> Result<(), Box<dyn Error>> {
             applied.insert(k.clone(), Value::from(v.clone()));
         }
     }
-    let mut builder = SessionStateBuilder::new()
+    let builder = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_iceberg_integration(IcebergIntegrationOptions::default());
+    #[cfg(feature = "sail-join-reorder")]
+    let builder = with_sail_join_reorder(builder);
+    let mut builder = builder;
     for (k, v) in &cfg.props {
         if k.starts_with("iceberg.") {
             builder.config().as_mut().unwrap().options_mut().set(k, v)?;
@@ -231,6 +252,8 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     ctx.register_catalog(&catalog_name, Arc::clone(&provider) as _);
 
     let opts = ctx.state().config().options().clone();
+    let physical_rules: Vec<String> =
+        ctx.state().physical_optimizers().iter().map(|r| r.name().to_string()).collect();
     let settings = json!({
         "file": cfg.props.iter()
             .filter(|(k, _)| !k.contains("secret") && !k.contains("access-key"))
@@ -240,6 +263,14 @@ async fn serve() -> Result<(), Box<dyn Error>> {
         "batch_size": opts.execution.batch_size.to_string().parse::<u64>().ok(),
         "memory_pool": { "kind": format!("PeakPool({})", pool.inner_name()), "limit": limit },
         "disk_manager": disk_desc,
+        "physical_optimizer_rules": physical_rules,
+        "optimizer": {
+            "join_reordering": opts.optimizer.join_reordering,
+            "hash_join_single_partition_threshold": opts.optimizer.hash_join_single_partition_threshold,
+            "hash_join_single_partition_threshold_rows": opts.optimizer.hash_join_single_partition_threshold_rows,
+            "enable_dynamic_filter_pushdown": opts.optimizer.enable_dynamic_filter_pushdown,
+        },
+        "session_options": session_options(&opts),
         "catalog": { "name": catalog_name, "uri": cfg.get("catalog.uri"),
                      "warehouse": cfg.get("catalog.warehouse") },
     });
@@ -266,6 +297,32 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     info!("Started dfrunner HTTP listener on {listen}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Session options a variant adds or changes, as the session sees them: the join-order
+/// options exist only in the `jo` build (apache/datafusion#24456), `iceberg.*` in all.
+fn session_options(opts: &datafusion::config::ConfigOptions) -> Value {
+    let wanted = ["datafusion.optimizer.join_enumeration", "datafusion.optimizer.join_enumeration_limit",
+                  "datafusion.optimizer.use_statistics_registry", "iceberg.column_stats_enabled"];
+    let mut out = serde_json::Map::new();
+    for entry in opts.entries() {
+        if wanted.contains(&entry.key.as_str()) {
+            out.insert(entry.key.clone(), Value::from(entry.value.clone()));
+        }
+    }
+    Value::Object(out)
+}
+
+/// Sail's `JoinReorder` rule (lakehq/sail, see src/sail_join_reorder), inserted just
+/// before `JoinSelection` in DataFusion's default physical rule list, as Sail places it in
+/// its own list. Sail's other rules are not added; the rest of the list is DataFusion's.
+#[cfg(feature = "sail-join-reorder")]
+fn with_sail_join_reorder(builder: SessionStateBuilder) -> SessionStateBuilder {
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    let mut rules = PhysicalOptimizer::new().rules;
+    let at = rules.iter().position(|r| r.name() == "join_selection").expect("JoinSelection in the default rules");
+    rules.insert(at, Arc::new(sail_join_reorder::JoinReorder::new(sail_join_reorder::JoinReorderOptions::default())));
+    builder.with_physical_optimizer_rules(rules)
 }
 
 async fn status(State(st): State<Shared>) -> Json<Value> {

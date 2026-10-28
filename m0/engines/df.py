@@ -1,4 +1,9 @@
-"""DataFusion adapter (engine `df`): HTTP to dfrunner in `single` mode.
+"""DataFusion adapter (engine `df` and its step 4c variants): HTTP to dfrunner in `single` mode.
+
+Variants (methodology section 2, `VARIANTS`): each is its own compose service on the same
+port with the same limits; only one runs at a time. `-cs` adds
+configs/datafusion/local/column-stats.properties; `jo` and `sail` are separate dfrunner
+builds (dfrunner/Dockerfile, DFRUNNER_VARIANT).
 
 dfrunner API (docs/framework-design.md, "dfrunner API"):
   GET    /health          200 once the catalog is connected
@@ -17,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 
 from m0 import env_local
 from m0.classify import EngineError
@@ -26,7 +32,36 @@ from m0.paths import CONFIGS_DIR, REPO_ROOT
 BASE_URL = env_local.DFRUNNER_URL
 CONFIG_DIR = CONFIGS_DIR / "datafusion" / "local"
 CONFIG_FILE = CONFIG_DIR / "dfrunner.properties"
-BUILD_FILES = ("dfrunner/Cargo.toml", "dfrunner/Cargo.lock", "dfrunner/Dockerfile")
+CS_CONFIG_FILE = CONFIG_DIR / "column-stats.properties"
+BUILD_FILES = ("dfrunner/Cargo.toml", "dfrunner/Cargo.lock", "dfrunner/Dockerfile", "dfrunner/build.rs",
+               "dfrunner/patches/prepare.sh")
+# Build variant -> extra files that define it (hashed into run.json with the config).
+VARIANT_BUILD_FILES = {
+    "df": (),
+    "jo": ("dfrunner/patches/datafusion-55.0.0-pr24456.patch", "dfrunner/patches/jo.Cargo.lock",
+           "dfrunner/patches/jo.cargo-patch.toml"),
+    "sail": tuple(f"dfrunner/src/sail_join_reorder/{f}" for f in (
+        "mod.rs", "builder.rs", "cardinality_estimator.rs", "cost_model.rs", "dp_plan.rs", "enumerator.rs",
+        "graph.rs", "join_set.rs", "reconstructor.rs", "early_filter/mod.rs", "early_filter/benefit.rs")),
+}
+
+
+@dataclass(frozen=True)
+class Variant:
+    build: str              # dfrunner build variant: df, jo or sail
+    build_service: str      # compose service that builds the image
+    column_stats: bool      # column-stats.properties on top of dfrunner.properties
+
+
+# Engine name = compose service name.
+VARIANTS = {
+    "df": Variant("df", "df", False),
+    "df-cs": Variant("df", "df", True),
+    "df-jo": Variant("jo", "df-jo", False),
+    "df-jo-cs": Variant("jo", "df-jo", True),
+    "df-sail": Variant("sail", "df-sail", False),
+    "df-sail-cs": Variant("sail", "df-sail", True),
+}
 READY_TIMEOUT_S = 180
 CANCEL_GRACE_S = 30
 _UNITS = {"KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
@@ -99,8 +134,11 @@ def operator_time(operators: list[dict] | None) -> dict:
 
 
 class DfEngine(Engine):
-    name = "df"
-    service = "df"
+    def __init__(self, name: str = "df"):
+        if name not in VARIANTS:
+            raise KeyError(f"no DataFusion variant {name!r}")
+        self.name = self.service = name
+        self.variant = VARIANTS[name]
 
     # ---- lifecycle ----
 
@@ -188,7 +226,7 @@ class DfEngine(Engine):
                 result.wall_ms = (time.perf_counter() - t0) * 1000
                 result.client_error = f"{type(e).__name__}: {e}"[:500]
 
-        thread = threading.Thread(target=work, name="m0-df-query", daemon=True)
+        thread = threading.Thread(target=work, name=f"m0-{self.name}-query", daemon=True)
         thread.start()
         thread.join(timeout_s)
         if thread.is_alive():
@@ -230,7 +268,9 @@ class DfEngine(Engine):
         return parse_bytes(read_properties(CONFIG_FILE).get("dfrunner.memory_pool.limit"))
 
     def config_files(self) -> list:
-        return [CONFIG_FILE, *(REPO_ROOT / f for f in BUILD_FILES)]
+        extra = [CS_CONFIG_FILE] if self.variant.column_stats else []
+        build = (*BUILD_FILES, *VARIANT_BUILD_FILES[self.variant.build])
+        return [CONFIG_FILE, *extra, *(REPO_ROOT / f for f in build)]
 
     def busy(self) -> bool:
         """After a cancel, the query task is aborted, but an operator inside a long CPU loop
@@ -245,5 +285,9 @@ class DfEngine(Engine):
         return True
 
     def describe(self) -> dict:
+        # Every variant listens on port 9000: only describe this engine if its own
+        # container is the one running (otherwise run.json would record another variant).
+        if not env_local.container_state(self.service).get("running"):
+            return {"error": f"{self.service} is not running"}
         st = self.status() or {}
         return {k: st.get(k) for k in ("mode", "versions", "settings")}

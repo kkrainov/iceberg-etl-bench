@@ -31,6 +31,11 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.48", features = ["full"] }
 
+[features]
+# Engine variant `df-sail` (step 4c): Sail's JoinReorder physical optimizer rule, see
+# src/sail_join_reorder/mod.rs. Off in the `df` build.
+sail-join-reorder = []
+
 [profile.release]
 # Build choice and measured cost: see the "Build" notes in configs/datafusion/local/dfrunner.properties.
 lto = "thin"

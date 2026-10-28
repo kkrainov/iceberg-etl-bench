@@ -64,20 +64,45 @@ def group_failures(rows: list[dict]) -> list[dict]:
     return sorted(groups.values(), key=lambda g: (g["engine"], -len(g["queries"]), g["outcome"]))
 
 
-def summarize(store: RunStore, seed: int = stats.BOOTSTRAP_SEED) -> dict:
-    run, rows = store.read_run(), store.rows()
+class MergeError(ValueError):
+    pass
+
+
+def merged_cells(store: RunStore, others: list[RunStore]) -> tuple[list[dict], list[dict]]:
+    """Cells and answers of `store` plus those of `others` (e.g. the baseline engines of
+    an earlier run on the same machine and data). Each engine must come from one run."""
+    rows, answers = store.rows(), store.answers()
+    owner = {r["engine"]: store.run_id for r in rows}
+    for o in others:
+        o_rows = o.rows()
+        for e in sorted({r["engine"] for r in o_rows}):
+            if e in owner:
+                raise MergeError(f"engine {e} is in both {owner[e]} and {o.run_id}")
+            owner[e] = o.run_id
+        rows += o_rows
+        answers += o.answers()
+    return rows, answers
+
+
+def summarize(store: RunStore, seed: int = stats.BOOTSTRAP_SEED, others: list[RunStore] | None = None) -> dict:
+    """Summary of one run; with `others`, their engines are added (MergeError if an engine
+    is in two runs), so engines from separate runs get ratios and answer diffs."""
+    others = others or []
+    run = store.read_run()
+    rows, answers = merged_cells(store, others)
     manifest = load_manifest()
-    diffs = differ.diff_answers(store.answers(), manifest)
+    diffs = differ.diff_answers(answers, manifest)
     eff = effective_rows(rows, diffs)
     qstats = stats.per_query(eff)
     suites = stats.suite_summaries(qstats, seed=seed)
     engines = sorted({r["engine"] for r in rows}, key=lambda e: (e != stats.REFERENCE, e))
     plan = run.get("plan") or {}
     planned = 0
-    if plan:
-        from m0 import plan as plan_mod
+    from m0 import plan as plan_mod
 
-        planned = len(plan_mod.expand(plan))
+    for p in [plan, *((o.read_run().get("plan") or {}) for o in others)]:
+        if p:
+            planned += len(plan_mod.expand(p))
     walls = [r["wall_ms"] for r in rows if r.get("wall_ms")]
     correctness = {}
     for e in engines:
@@ -87,6 +112,9 @@ def summarize(store: RunStore, seed: int = stats.BOOTSTRAP_SEED) -> dict:
             correctness[e] = {"counts": dict(Counter(d.status for d in ds)), "rules": dict(rules)}
     return {
         "run_id": store.run_id, "dir": str(store.dir), "plan": plan.get("name"), "sf": plan.get("sf"),
+        "merged": [{"run_id": o.run_id, "plan": (o.read_run().get("plan") or {}).get("name"),
+                    "sf": (o.read_run().get("plan") or {}).get("sf"),
+                    "engines": sorted({r["engine"] for r in o.rows()})} for o in others],
         "rounds": plan.get("rounds"), "iterations": plan.get("iterations"),
         "started_at": run.get("started_at"), "finished_at": run.get("finished_at"),
         "planned": planned, "recorded": len(rows), "engines": engines,
@@ -130,6 +158,9 @@ def render_summary(s: dict, max_lines: int = MAX_LINES) -> list[str]:
     state = "complete" if s["recorded"] >= s["planned"] else f"incomplete ({s['recorded']}/{s['planned']} cells)"
     head = [f"run {s['run_id']} (plan {s['plan']}, sf {s['sf']}, {s['rounds']} rounds x {s['iterations']} hot): "
             f"{state}, {s['recorded']} cells, {s['query_seconds'] / 60:.1f} min of query time"]
+    for m in s.get("merged") or []:
+        warn = "" if m["sf"] == s["sf"] else f"; WARN sf {m['sf']} differs"
+        head.append(f"  + {', '.join(m['engines'])} from run {m['run_id']} (plan {m['plan']}{warn})")
     for e in s["engines"]:
         head.append(f"  {e:<6} {counts_line(s['counts'][e])}")
     for e, c in s["correctness"].items():
@@ -197,13 +228,20 @@ def _engine_info(run: dict, engine: str) -> dict:
             "version": ((e.get("info") or {}).get("versions") or (e.get("info") or {}).get("version"))}
 
 
-def compare(a: RunStore, b: RunStore, seed: int = stats.BOOTSTRAP_SEED, noise: float = 0.10) -> dict:
-    """Run b against run a, per engine: time ratio b/a (above 1: b is slower)."""
+def compare(a: RunStore, b: RunStore, seed: int = stats.BOOTSTRAP_SEED, noise: float = 0.10,
+            pairs: list[tuple[str, str]] | None = None) -> dict:
+    """Run b against run a, per engine: time ratio b/a (above 1: b is slower).
+
+    `pairs` compares engine x of run a with engine y of run b instead (e.g. `df` of a
+    baseline run with a variant `df-jo` of a later one); a and b may be the same run.
+    Entries are keyed `x:y` when x and y differ."""
     ra, rb = a.read_run(), b.read_run()
     manifest = load_manifest()
     sa = stats.per_query(effective_rows(a.rows(), differ.diff_answers(a.answers(), manifest)))
     sb = stats.per_query(effective_rows(b.rows(), differ.diff_answers(b.answers(), manifest)))
-    engines = sorted({k[0] for k in sa} & {k[0] for k in sb}, key=lambda e: (e != stats.REFERENCE, e))
+    if pairs is None:
+        common = sorted({k[0] for k in sa} & {k[0] for k in sb}, key=lambda e: (e != stats.REFERENCE, e))
+        pairs = [(e, e) for e in common]
     out = {"a": {"run_id": a.run_id, "plan": (ra.get("plan") or {}).get("name"), "sf": (ra.get("plan") or {}).get("sf"),
                  "git": (ra.get("git") or {}).get("sha")},
            "b": {"run_id": b.run_id, "plan": (rb.get("plan") or {}).get("name"), "sf": (rb.get("plan") or {}).get("sf"),
@@ -212,30 +250,33 @@ def compare(a: RunStore, b: RunStore, seed: int = stats.BOOTSTRAP_SEED, noise: f
     images_a, images_b = ra.get("images") or {}, rb.get("images") or {}
     out["images_changed"] = sorted(k for k in set(images_a) | set(images_b)
                                    if (images_a.get(k) or {}).get("id") != (images_b.get(k) or {}).get("id"))
-    for e in engines:
-        ia, ib = _engine_info(ra, e), _engine_info(rb, e)
+    for ea, eb in pairs:
+        e = ea if ea == eb else f"{ea}:{eb}"
+        ia, ib = _engine_info(ra, ea), _engine_info(rb, eb)
         changed = sorted(k for k in set(ia["config_hashes"]) | set(ib["config_hashes"])
                          if ia["config_hashes"].get(k) != ib["config_hashes"].get(k))
-        both = sorted({(s, q) for (x, s, q) in sa if x == e} & {(s, q) for (x, s, q) in sb if x == e})
-        done = [(s, q) for s, q in both if sa[(e, s, q)].completed and sb[(e, s, q)].completed]
+        qa_keys = {(s, q) for (x, s, q) in sa if x == ea}
+        qb_keys = {(s, q) for (x, s, q) in sb if x == eb}
+        both = sorted(qa_keys & qb_keys)
+        done = [(s, q) for s, q in both if sa[(ea, s, q)].completed and sb[(eb, s, q)].completed]
         per = []
         for s, q in done:
-            qa, qb = sa[(e, s, q)], sb[(e, s, q)]
+            qa, qb = sa[(ea, s, q)], sb[(eb, s, q)]
             r = qb.median_s / qa.median_s if qa.median_s else None
             band = max(noise, 2 * max(qa.cv or 0, qb.cv or 0))
             per.append({"query": f"{s}/{q}", "a_s": qa.median_s, "b_s": qb.median_s, "ratio": r,
                         "beyond_noise": r is not None and abs(r - 1) > band})
-        changes = [{"query": f"{s}/{q}", "a": sa[(e, s, q)].outcome, "b": sb[(e, s, q)].outcome}
-                   for s, q in both if sa[(e, s, q)].outcome != sb[(e, s, q)].outcome]
-        mixed = sum(sa[(e, s, q)].hot != sb[(e, s, q)].hot for s, q in done)
-        ta = sum(sa[(e, s, q)].median_s for s, q in done)
-        tb = sum(sb[(e, s, q)].median_s for s, q in done)
-        ci = stats.bootstrap([(sb[(e, s, q)].samples, sa[(e, s, q)].samples) for s, q in done], seed=seed)
+        changes = [{"query": f"{s}/{q}", "a": sa[(ea, s, q)].outcome, "b": sb[(eb, s, q)].outcome}
+                   for s, q in both if sa[(ea, s, q)].outcome != sb[(eb, s, q)].outcome]
+        mixed = sum(sa[(ea, s, q)].hot != sb[(eb, s, q)].hot for s, q in done)
+        ta = sum(sa[(ea, s, q)].median_s for s, q in done)
+        tb = sum(sb[(eb, s, q)].median_s for s, q in done)
+        ci = stats.bootstrap([(sb[(eb, s, q)].samples, sa[(ea, s, q)].samples) for s, q in done], seed=seed)
         out["engines"][e] = {
+            "engine_a": ea, "engine_b": eb,
             "version_a": ia["version"], "version_b": ib["version"], "config_changed": changed,
             "queries_both": len(both), "completed_both": len(done), "hot_vs_first_run": mixed,
-            "only_a": len({(s, q) for (x, s, q) in sa if x == e}) - len(both),
-            "only_b": len({(s, q) for (x, s, q) in sb if x == e}) - len(both),
+            "only_a": len(qa_keys) - len(both), "only_b": len(qb_keys) - len(both),
             "total_a": ta, "total_b": tb, "ratio_total": tb / ta if ta else None,
             "geomean": stats.geomean([p["ratio"] for p in per if p["ratio"]]),
             "geomean_ci": ci["geomean_ci"], "total_ratio_ci": ci["total_ratio_ci"],

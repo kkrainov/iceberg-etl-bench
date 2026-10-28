@@ -20,6 +20,17 @@ Adapted files:
   Derived from apache/datafusion@36f393559620235c250f68727e3243cc7f429db8:benchmarks/queries/q<N>.sql
   (TPC-H query text; table names prefixed, q04 date literal, q15 view as a WITH query)
 
+- dfrunner/src/sail_join_reorder/ (all files)
+  Derived from lakehq/sail@86dea385943c785b38d85479755589d193f989d3:crates/sail-physical-optimizer/src/join_reorder/
+  (Sail's JoinReorder physical optimizer rule; built only into the `sail` dfrunner
+  variant, engines df-sail and df-sail-cs. Changes are listed at the top of mod.rs.)
+- dfrunner/patches/datafusion-55.0.0-pr24456.patch
+  Derived from apache/datafusion pull request #24456 (Dandandan/datafusion branch
+  perf/join-order-enumeration, head 472e83e1289eec0b482a5b3d4d0dc1f5140fe878), diffed
+  against its merge base 242b96c231636b5738125678a83197896a5cc64b and adapted to
+  DataFusion 55.0.0 (the patch header lists the changes). Applied to DataFusion 55.0.0
+  sources at build time for the `jo` dfrunner variant (engines df-jo and df-jo-cs).
+
 Libraries used by dfrunner (dependencies, not copied code): Apache DataFusion,
 datafusion-distributed and datafusion-distributed-iceberg, Apache Iceberg Rust
 (iceberg, iceberg-catalog-rest, iceberg-storage-opendal), apache/datafusion-iceberg.
@@ -29,6 +40,7 @@ Sources:
 
 - datafusion-contrib/datafusion-distributed (https://github.com/datafusion-contrib/datafusion-distributed)
 - apache/datafusion (https://github.com/apache/datafusion)
+- lakehq/sail (https://github.com/lakehq/sail)
 - trinodb/trino (https://github.com/trinodb/trino)
 - ClickHouse/ClickBench (https://github.com/ClickHouse/ClickBench)
 

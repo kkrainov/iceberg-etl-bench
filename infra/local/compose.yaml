@@ -113,30 +113,89 @@ services:
       args:
         BUILDER_IMAGE: ${M0_IMAGE_DFRUNNER_BUILDER}
         RUNTIME_IMAGE: ${M0_IMAGE_DFRUNNER_RUNTIME}
-    command: ["single"]
-    # tini as PID 1: dfrunner has no SIGTERM handler, so without it every stop (engine
-    # switch, cold restart) waited out Docker's 10 s grace period before SIGKILL.
-    init: true
-    environment:
+        DFRUNNER_VARIANT: df
+    <<: &dfrunner
+      command: ["single"]
+      # tini as PID 1: dfrunner has no SIGTERM handler, so without it every stop (engine
+      # switch, cold restart) waited out Docker's 10 s grace period before SIGKILL.
+      init: true
+      environment:
+        <<: *s3-creds
+        RUST_LOG: info
+      volumes:
+        - ../../configs/datafusion/local/dfrunner.properties:/etc/dfrunner/dfrunner.properties:ro
+      ports:
+        - "127.0.0.1:9000:9000"
+      healthcheck:
+        test: ["CMD", "/usr/local/bin/dfrunner", "healthcheck"]
+        interval: 1s
+        timeout: 5s
+        retries: 120
+      depends_on:
+        catalog:
+          condition: service_healthy
+        objstore:
+          condition: service_healthy
+      mem_limit: ${M0_ENGINE_MEM:-8g}
+      memswap_limit: ${M0_ENGINE_MEM:-8g}
+      cpus: ${M0_ENGINE_CPUS:-12}
+
+  # Step 4c engine variants (methodology section 2): `df` with one change each, same
+  # limits, port and base config. Images: m0-dfrunner:local (built by `df`),
+  # m0-dfrunner-jo:local (apache/datafusion#24456 backport, built by `df-jo`),
+  # m0-dfrunner-sail:local (Sail's JoinReorder rule, built by `df-sail`); `m0 env up`
+  # builds through those services. `-cs`: column statistics on
+  # (configs/datafusion/local/column-stats.properties, read after the base file).
+  df-cs:
+    profiles: ["df-cs"]
+    image: m0-dfrunner:local
+    pull_policy: never
+    <<: *dfrunner
+    environment: &dfrunner-cs-env
       <<: *s3-creds
       RUST_LOG: info
-    volumes:
+      DFRUNNER_CONFIG_EXTRA: /etc/dfrunner/extra.properties
+    volumes: &dfrunner-cs-volumes
       - ../../configs/datafusion/local/dfrunner.properties:/etc/dfrunner/dfrunner.properties:ro
-    ports:
-      - "127.0.0.1:9000:9000"
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/dfrunner", "healthcheck"]
-      interval: 1s
-      timeout: 5s
-      retries: 120
-    depends_on:
-      catalog:
-        condition: service_healthy
-      objstore:
-        condition: service_healthy
-    mem_limit: ${M0_ENGINE_MEM:-8g}
-    memswap_limit: ${M0_ENGINE_MEM:-8g}
-    cpus: ${M0_ENGINE_CPUS:-12}
+      - ../../configs/datafusion/local/column-stats.properties:/etc/dfrunner/extra.properties:ro
+
+  df-jo:
+    profiles: ["df-jo"]
+    image: m0-dfrunner-jo:local
+    build:
+      context: ../../dfrunner
+      args:
+        BUILDER_IMAGE: ${M0_IMAGE_DFRUNNER_BUILDER}
+        RUNTIME_IMAGE: ${M0_IMAGE_DFRUNNER_RUNTIME}
+        DFRUNNER_VARIANT: jo
+    <<: *dfrunner
+
+  df-jo-cs:
+    profiles: ["df-jo-cs"]
+    image: m0-dfrunner-jo:local
+    pull_policy: never
+    <<: *dfrunner
+    environment: *dfrunner-cs-env
+    volumes: *dfrunner-cs-volumes
+
+  df-sail:
+    profiles: ["df-sail"]
+    image: m0-dfrunner-sail:local
+    build:
+      context: ../../dfrunner
+      args:
+        BUILDER_IMAGE: ${M0_IMAGE_DFRUNNER_BUILDER}
+        RUNTIME_IMAGE: ${M0_IMAGE_DFRUNNER_RUNTIME}
+        DFRUNNER_VARIANT: sail
+    <<: *dfrunner
+
+  df-sail-cs:
+    profiles: ["df-sail-cs"]
+    image: m0-dfrunner-sail:local
+    pull_policy: never
+    <<: *dfrunner
+    environment: *dfrunner-cs-env
+    volumes: *dfrunner-cs-volumes
 
 volumes:
   objstore-data:

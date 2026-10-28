@@ -1,0 +1,3236 @@
+Backport of apache/datafusion#24456 (cost-based join order enumeration, DPhyp) onto
+DataFusion 55.0.0, for the dfrunner `jo` build (engines `df-jo`, `df-jo-cs`).
+
+Source: Dandandan/datafusion branch perf/join-order-enumeration, PR head
+472e83e1289eec0b482a5b3d4d0dc1f5140fe878, diffed against its merge base with main,
+242b96c231636b5738125678a83197896a5cc64b (the PR's own changes only). Taken: every
+non-test source file of the PR (datafusion-common, datafusion-physical-optimizer,
+datafusion-physical-plan). Left out: tests, sqllogictest files and docs.
+The head already contains its own copy of the join total_byte_size change from
+apache/datafusion#24536 (joins/utils.rs); that copy is what is applied here.
+apache/datafusion#24517, #24520 and #24558 (merged after 55.0.0) are not included: the
+code compiles without them (checked), and #24558 would change hash_join_single_partition_threshold
+for every join, not only reordered ones.
+
+Applied to the crates.io 55.0.0 sources of those three crates (identical to the 55.0.0
+tag's src/); paths below are the apache/datafusion repository's.
+Conflicts resolved against 55.0.0 (main had moved on):
+- common/src/config.rs: keep 55.0.0's `use_statistics_registry` option (main
+  deprecated it); add `join_enumeration` (default true) and `join_enumeration_limit`.
+- physical-optimizer/src/join_selection.rs: keep 55.0.0's statistics lookup (registry
+  only with `use_statistics_registry`); add the PR's `keep_partitioning_needed_above`
+  pass, taking that registry instead of the optimizer context.
+- physical-optimizer/src/join_enumeration/mod.rs: statistics come from where 55.0.0's
+  JoinSelection takes them (main's `StatisticsContext::new_with_registry` does not
+  exist in 55.0.0).
+Compile fixes for 55.0.0 (no behaviour change):
+- physical-plan/src/filter.rs: import `InListExpr` (main imported it already).
+- join_enumeration/mod.rs: `default_filter_selectivity` is a plain u8 in 55.0.0 (no `.get()`).
+Not taken: the PR's tests. Behaviour that differs from plain 55.0.0 even with
+`join_enumeration=false`: JoinSelection's new `keep_partitioning_needed_above` pass and
+the filter estimates (per conjunct, IN lists) in physical-plan/src/filter.rs.
+
+diff --git a/datafusion/common/src/config.rs b/datafusion/common/src/config.rs
+index f5742f0..1dac382 100644
+--- a/datafusion/common/src/config.rs
++++ b/datafusion/common/src/config.rs
+@@ -1672,6 +1672,18 @@ config_namespace! {
+         /// query is used.
+         pub join_reordering: bool, default = true
+ 
++        /// When set to true, the physical plan optimizer enumerates join orders for
++        /// subtrees of joins and picks the cheapest from cardinality estimates,
++        /// considering bushy shapes as well as left-deep ones. Subtrees whose inputs
++        /// lack row count statistics are left untouched.
++        pub join_enumeration: bool, default = true
++
++        /// Maximum inputs in a join subtree for which `join_enumeration` searches, at a
++        /// cost that grows with how many of them share a join predicate. Larger subtrees
++        /// keep the planner's order, as do subtrees of more than 16 inputs regardless of
++        /// this setting.
++        pub join_enumeration_limit: usize, default = 16
++
+         /// When set to true, the physical plan optimizer uses the pluggable
+         /// `StatisticsRegistry` for statistics propagation across operators.
+         /// This enables more accurate cardinality estimates compared to each
+diff --git a/datafusion/physical-optimizer/src/join_enumeration/dphyp.rs b/datafusion/physical-optimizer/src/join_enumeration/dphyp.rs
+new file mode 100644
+index 0000000..b41f8df
+--- /dev/null
++++ b/datafusion/physical-optimizer/src/join_enumeration/dphyp.rs
+@@ -0,0 +1,393 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++//! Connectivity-driven join order enumeration, after Moerkotte and Neumann's
++//! *Dynamic Programming Strikes Back* (SIGMOD 2008).
++//!
++//! Rather than walk all `3^n` splits of the relation subsets and keep the ones a
++//! predicate spans, this walks the predicates: it grows connected subgraphs, and for each
++//! grows the connected complements it can join. It reaches the same pairs, so it finds the
++//! same plan, but a sparse graph has far fewer connected pairs than it has splits.
++//!
++//! Each pair is reached once, from the lowest-numbered relation it holds: a subgraph grown
++//! from relation `i` may not reach back below `i`, and a complement is grown from its own
++//! lowest neighbour of the subgraph. That is what the `excluded` sets carry.
++//!
++//! A predicate over three or more relations links all of them pairwise here, as it does
++//! for [`DefaultJoinCostModel`]: the search has to reach every pair that model admits,
++//! and [`DpTable::join`] prunes what it rejects. So a cost model can narrow the search
++//! but not widen it past the graph's own predicates.
++//!
++//! [`DefaultJoinCostModel`]: super::DefaultJoinCostModel
++
++use super::graph::{JoinGraph, RelSet, bit, iter_rels};
++use super::{DpTable, JoinCostModel, Solution};
++
++pub(super) fn solve(graph: &JoinGraph, model: &dyn JoinCostModel) -> Option<Solution> {
++    let mut search = DpHyp {
++        adjacency: adjacency(graph),
++        table: DpTable::new(model, graph.relations.len()),
++    };
++    // Highest relation first, each forbidding the ones below it.
++    for rel in (0..graph.relations.len()).rev() {
++        search.emit_csg(bit(rel));
++        search.grow_csg(bit(rel), upto(rel));
++    }
++    search.table.solution(graph.all())
++}
++
++struct DpHyp<'a> {
++    /// Which relations each relation shares a predicate with.
++    adjacency: Vec<RelSet>,
++    table: DpTable<'a>,
++}
++
++impl DpHyp<'_> {
++    /// The relations one predicate away from `set`, less the excluded ones.
++    fn neighbours(&self, set: RelSet, excluded: RelSet) -> RelSet {
++        iter_rels(set).fold(0, |mask, rel| mask | self.adjacency[rel]) & !excluded & !set
++    }
++
++    /// Whether a predicate spans the two sets.
++    fn connected(&self, left: RelSet, right: RelSet) -> bool {
++        iter_rels(left).any(|rel| self.adjacency[rel] & right != 0)
++    }
++
++    /// Joins the connected subgraph `csg` with each connected complement it has.
++    fn emit_csg(&mut self, csg: RelSet) {
++        let excluded = csg | upto(csg.trailing_zeros() as usize);
++        let neighbours = self.neighbours(csg, excluded);
++        for rel in iter_rels(neighbours) {
++            // A complement grows from its own lowest neighbour of `csg`, so a complement
++            // started here leaves the neighbours below `rel` to their own turn.
++            self.table.join(csg, bit(rel));
++            self.grow_cmp(csg, bit(rel), excluded | (neighbours & upto(rel)));
++        }
++    }
++
++    /// Grows `csg` into the larger connected subgraphs reachable from it, emitting each.
++    fn grow_csg(&mut self, csg: RelSet, excluded: RelSet) {
++        let neighbours = self.neighbours(csg, excluded);
++        // Every subgraph one step out is emitted before any of them grows further: a
++        // subgraph's own splits must all be costed before it is joined to a complement.
++        for grown in subsets(neighbours) {
++            if self.table.planned(csg | grown) {
++                self.emit_csg(csg | grown);
++            }
++        }
++        for grown in subsets(neighbours) {
++            self.grow_csg(csg | grown, excluded | neighbours);
++        }
++    }
++
++    /// Grows the complement `cmp`, joining `csg` with each larger one still connected to
++    /// it. A complement holds only relations above `csg`'s lowest, so its own plans are
++    /// complete: they were costed in an earlier turn of the outer loop.
++    fn grow_cmp(&mut self, csg: RelSet, cmp: RelSet, excluded: RelSet) {
++        let neighbours = self.neighbours(cmp, excluded);
++        for grown in subsets(neighbours) {
++            let grown = cmp | grown;
++            if self.table.planned(grown) && self.connected(csg, grown) {
++                self.table.join(csg, grown);
++            }
++        }
++        for grown in subsets(neighbours) {
++            self.grow_cmp(csg, cmp | grown, excluded | neighbours);
++        }
++    }
++}
++
++/// Which relations each relation shares a predicate with. An applied relation links to
++/// the relations its keys come from: those are the ones it can be applied to.
++fn adjacency(graph: &JoinGraph) -> Vec<RelSet> {
++    let mut adjacency = vec![0 as RelSet; graph.relations.len()];
++    for edge in &graph.edges {
++        adjacency[edge.left.column.rel] |= bit(edge.right.column.rel);
++        adjacency[edge.right.column.rel] |= bit(edge.left.column.rel);
++    }
++    for filter in &graph.filters {
++        for rel in iter_rels(filter.required) {
++            adjacency[rel] |= filter.required & !bit(rel);
++        }
++    }
++    for rel in 0..graph.relations.len() {
++        if let Some(applied) = graph.applied(rel) {
++            adjacency[rel] |= applied.required;
++            for required in iter_rels(applied.required) {
++                adjacency[required] |= bit(rel);
++            }
++        }
++    }
++
++    // A cut that separates whole components is a cross product, and the cost model prices
++    // one by the pairs it forms, so a cross product below a join can be cheaper than the
++    // same one above it. Link the components, and the search reaches those cuts as well;
++    // what it then reaches that no predicate and no such cut allows, `combine` prunes.
++    let components = components(&adjacency);
++    if components.len() > 1 {
++        let all = components
++            .iter()
++            .fold(0, |mask, component| mask | component);
++        for component in &components {
++            for rel in iter_rels(*component) {
++                adjacency[rel] |= all & !component;
++            }
++        }
++    }
++    adjacency
++}
++
++/// The relations of each set of them no predicate reaches out of.
++fn components(adjacency: &[RelSet]) -> Vec<RelSet> {
++    let mut components: Vec<RelSet> = vec![];
++    let mut seen: RelSet = 0;
++    for rel in 0..adjacency.len() {
++        if seen & bit(rel) != 0 {
++            continue;
++        }
++        let mut component = bit(rel);
++        loop {
++            let grown =
++                iter_rels(component).fold(component, |mask, rel| mask | adjacency[rel]);
++            if grown == component {
++                break;
++            }
++            component = grown;
++        }
++        seen |= component;
++        components.push(component);
++    }
++    components
++}
++
++/// Every relation up to and including `rel`.
++fn upto(rel: usize) -> RelSet {
++    bit(rel) | (bit(rel) - 1)
++}
++
++/// The non-empty subsets of `mask`, each of them after all of its own subsets.
++fn subsets(mask: RelSet) -> impl Iterator<Item = RelSet> {
++    // Counting in the bits of `mask`: subtracting it borrows from the bits above the ones
++    // the subtraction clears, which is the increment.
++    std::iter::successors(Some(0 as RelSet), move |subset| {
++        Some(subset.wrapping_sub(mask) & mask)
++    })
++    .skip(1)
++    .take_while(|subset| *subset != 0)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::join_enumeration::graph::{
++        Applied, AppliedKey, AppliedKind, ColRef, Edge, Filter, Key, Relation, Role,
++    };
++    use crate::join_enumeration::{DefaultJoinCostModel, DpTable};
++
++    use std::sync::Arc;
++
++    use arrow::datatypes::{DataType, Field, Schema};
++    use datafusion_common::config::ConfigOptions;
++    use datafusion_physical_expr::expressions::{Column, lit};
++    use datafusion_physical_plan::empty::EmptyExec;
++    use datafusion_physical_plan::joins::utils::JoinFilter;
++
++    /// Deterministic pseudo-randomness, so a failing seed can be rerun.
++    struct Rng(u64);
++
++    impl Rng {
++        fn next(&mut self) -> u64 {
++            self.0 = self
++                .0
++                .wrapping_mul(6364136223846793005)
++                .wrapping_add(1442695040888963407);
++            self.0 >> 33
++        }
++
++        fn below(&mut self, limit: usize) -> usize {
++            (self.next() % limit as u64) as usize
++        }
++
++        fn chance(&mut self, percent: u64) -> bool {
++            self.next() % 100 < percent
++        }
++    }
++
++    const COLUMNS: usize = 2;
++
++    fn key(rel: usize, col: usize) -> Key {
++        Key {
++            column: ColRef { rel, col },
++            wrapper: None,
++        }
++    }
++
++    fn relation(rows: f64, role: Role) -> Relation {
++        let fields: Vec<Field> = (0..COLUMNS)
++            .map(|col| Field::new(format!("c{col}"), DataType::Int32, true))
++            .collect();
++        Relation {
++            plan: Arc::new(EmptyExec::new(Arc::new(Schema::new(fields)))),
++            rows,
++            width: Some(8.0),
++            ndv: vec![(rows / 2.0).max(1.0); COLUMNS],
++            role,
++        }
++    }
++
++    /// A graph of `relations` relations: a random tree of equi-joins unless `disconnect`
++    /// leaves one out of it, plus extra edges, a multi-relation filter, and relations
++    /// applied to the rest by a semi, anti, outer or mark join.
++    fn random_graph(rng: &mut Rng, relations: usize, disconnect: bool) -> JoinGraph {
++        let mut graph = JoinGraph {
++            relations: (0..relations)
++                .map(|_| {
++                    relation(10u64.pow(1 + rng.below(5) as u32) as f64, Role::Output)
++                })
++                .collect(),
++            edges: vec![],
++            filters: vec![],
++            output: vec![],
++            null_equality: None,
++            original_nodes: vec![],
++            applied: 0,
++            kind: None,
++        };
++
++        let mut connected = vec![0];
++        for rel in 1..relations {
++            // Leaving one relation unconnected exercises cross products.
++            if disconnect && rel == relations - 1 {
++                continue;
++            }
++            let parent = connected[rng.below(connected.len())];
++            graph.edges.push(Edge {
++                left: key(parent, rng.below(COLUMNS)),
++                right: key(rel, rng.below(COLUMNS)),
++            });
++            connected.push(rel);
++        }
++        for _ in 0..rng.below(relations) {
++            let (left, right) = (rng.below(relations), rng.below(relations));
++            if left != right {
++                graph.edges.push(Edge {
++                    left: key(left, rng.below(COLUMNS)),
++                    right: key(right, rng.below(COLUMNS)),
++                });
++            }
++        }
++
++        // A relation joined by a semi, anti, outer or mark join is applied instead: it has
++        // no edges, and its keys name the relations it can be applied to.
++        for rel in (1..relations).rev() {
++            let joined = graph
++                .edges
++                .iter()
++                .any(|edge| [edge.left.column.rel, edge.right.column.rel].contains(&rel));
++            if joined || !rng.chance(25) {
++                continue;
++            }
++            let required: Vec<usize> = (0..rel).filter(|_| rng.chance(40)).collect();
++            if required.is_empty() {
++                continue;
++            }
++            graph.applied |= bit(rel);
++            graph.relations[rel].role = Role::Applied(Applied {
++                kind: match rng.below(4) {
++                    0 => AppliedKind::Semi,
++                    1 => AppliedKind::Anti,
++                    2 => AppliedKind::Outer,
++                    _ => AppliedKind::Mark,
++                },
++                keys: required
++                    .iter()
++                    .map(|other| AppliedKey {
++                        other: key(*other, 0),
++                        column: 0,
++                        expr: Arc::new(Column::new("c0", 0)),
++                    })
++                    .collect(),
++                required: required.iter().fold(0, |mask, rel| mask | bit(*rel)),
++            });
++        }
++
++        if relations > 3 && rng.chance(40) {
++            let required = (0..relations)
++                .filter(|rel| graph.applied & bit(*rel) == 0)
++                .filter(|_| rng.chance(50))
++                .fold(0, |mask, rel| mask | bit(rel));
++            if required.count_ones() > 1 {
++                graph.filters.push(Filter {
++                    filter: JoinFilter::new(lit(true), vec![], Arc::new(Schema::empty())),
++                    columns: vec![],
++                    required,
++                });
++            }
++        }
++        graph
++    }
++
++    /// Every split of every subset. The search visits far fewer pairs than this, so this
++    /// is what says it does not miss any.
++    fn full_search(graph: &JoinGraph, model: &dyn JoinCostModel) -> Option<Solution> {
++        let full = graph.all();
++        let mut table = DpTable::new(model, graph.relations.len());
++        for mask in 1..=full {
++            if mask.count_ones() < 2 {
++                continue;
++            }
++            // Subsets holding the lowest set bit, so each pair of halves is seen once.
++            let lowest = mask & mask.wrapping_neg();
++            let mut left = mask;
++            while left != 0 {
++                left = (left - 1) & mask;
++                if left & lowest != 0 {
++                    table.join(left, mask ^ left);
++                }
++            }
++        }
++        table.solution(full)
++    }
++
++    #[test]
++    fn finds_what_a_full_search_finds() {
++        let config = ConfigOptions::new();
++        for seed in 0..400 {
++            let mut rng = Rng(seed);
++            let relations = 3 + rng.below(6);
++            let disconnect = rng.chance(25);
++            let graph = random_graph(&mut rng, relations, disconnect);
++            let model = DefaultJoinCostModel::new(&graph, &config);
++
++            match (full_search(&graph, &model), solve(&graph, &model)) {
++                (None, None) => {}
++                (Some(full), Some(found)) => assert!(
++                    (full.cost - found.cost).abs() <= full.cost * 1e-9,
++                    "seed {seed}: full search {} vs dphyp {}, graph {graph:?}",
++                    full.cost,
++                    found.cost
++                ),
++                (full, found) => panic!(
++                    "seed {seed}: full search {} and dphyp {} disagree on solvability, \
++                     graph {graph:?}",
++                    full.is_some(),
++                    found.is_some()
++                ),
++            }
++        }
++    }
++}
+diff --git a/datafusion/physical-optimizer/src/join_enumeration/graph.rs b/datafusion/physical-optimizer/src/join_enumeration/graph.rs
+new file mode 100644
+index 0000000..0cfb949
+--- /dev/null
++++ b/datafusion/physical-optimizer/src/join_enumeration/graph.rs
+@@ -0,0 +1,777 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++//! The join graph: a subtree of joins as relations plus the predicates between them.
++//!
++//! Extraction flattens a subtree into a [`JoinGraph`], which is what
++//! [`JoinCostModel`](super::JoinCostModel) estimates over and what the rebuilt tree is
++//! assembled from.
++
++use std::sync::Arc;
++
++use datafusion_common::error::Result;
++use datafusion_common::{JoinSide, JoinType, NullEquality, Statistics, internal_err};
++use datafusion_physical_expr::PhysicalExprRef;
++use datafusion_physical_expr::expressions::{CastExpr, Column, TryCastExpr};
++use datafusion_physical_plan::joins::utils::{
++    ColumnIndex, JoinFilter, max_distinct_count,
++};
++use datafusion_physical_plan::joins::{
++    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
++};
++use datafusion_physical_plan::projection::{ProjectionExec, all_alias_free_columns};
++use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
++
++/// Hard upper bound on the relations in one join graph. The search allocates `2^n`
++/// subsets, so larger graphs keep the planner's order regardless of the limit.
++pub(crate) const MAX_RELATIONS: usize = 16;
++
++/// Computes a plan node's statistics, shared with the rest of `JoinSelection`.
++pub(crate) type StatsFn<'a> =
++    dyn FnMut(&dyn ExecutionPlan) -> Result<Arc<Statistics>> + 'a;
++
++/// A bitmask over relation indices.
++pub type RelSet = u64;
++
++/// The set holding `rel` alone.
++pub fn bit(rel: usize) -> RelSet {
++    1u64 << rel
++}
++
++/// The relations in `mask`, lowest index first.
++pub fn iter_rels(mask: RelSet) -> impl Iterator<Item = usize> {
++    std::iter::successors(Some(mask), |m| Some(m & m.wrapping_sub(1)))
++        .take_while(|m| *m != 0)
++        .map(|m| m.trailing_zeros() as usize)
++}
++
++/// Whether `mask` holds every relation in `required`.
++pub fn covers(mask: RelSet, required: RelSet) -> bool {
++    required & !mask == 0
++}
++
++/// One column of one relation, tracked instead of a plain index because reordering
++/// moves columns to other positions.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub struct ColRef {
++    /// Index into [`JoinGraph::relations`].
++    pub rel: usize,
++    /// Index into that relation's schema.
++    pub col: usize,
++}
++
++/// What a relation contributes to the join.
++#[derive(Debug)]
++pub enum Role {
++    /// An ordinary input, contributing its columns.
++    Output,
++    /// A side applied to the relations its keys come from rather than joined freely:
++    /// the quantified side of a semi or anti join, or the null-supplying side of an
++    /// outer join.
++    Applied(Applied),
++}
++
++/// A side of one join that is applied to the relations its keys come from, as what
++/// applying it does to them.
++#[derive(Debug)]
++pub struct Applied {
++    /// What it does to the side it is applied to.
++    pub kind: AppliedKind,
++    /// What it is joined by.
++    pub keys: Vec<AppliedKey>,
++    /// Relations the keys reference; it applies only to a set covering them.
++    pub required: RelSet,
++}
++
++/// One key of an applied join. The relation is emitted whole, so its own side keeps the
++/// expression it had; the other side's moves with its column.
++#[derive(Debug)]
++pub struct AppliedKey {
++    /// The key on the side this relation is applied to.
++    pub other: Key,
++    /// The column this side reads, for its distinct count.
++    pub column: usize,
++    /// The expression this side compares, as it stood.
++    pub expr: PhysicalExprRef,
++}
++
++/// The column a mark join's flag is addressed by. It is not a column of the relation the
++/// flag comes from but a boolean the join itself produces, so it has no statistics and
++/// nothing may use it as a key.
++pub const MARK_COLUMN: usize = usize::MAX;
++
++/// What applying one side of a join does to the other.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum AppliedKind {
++    /// A semi join: keeps the rows of the other side that match.
++    Semi,
++    /// An anti join: keeps the rows that do not match.
++    Anti,
++    /// An outer join: keeps every row of the other side, adding this side's columns and
++    /// nulls where nothing matched.
++    Outer,
++    /// A mark join: keeps every row of the other side, adding one boolean saying whether
++    /// anything matched.
++    Mark,
++}
++
++impl AppliedKind {
++    /// The columns this side contributes to the join's output, given how many its plan
++    /// has. A semi or anti join contributes none: it emits the rows it kept and nothing
++    /// of the side that filtered them.
++    pub fn emitted(self, rel: usize, fields: usize) -> Vec<ColRef> {
++        match self {
++            AppliedKind::Semi | AppliedKind::Anti => vec![],
++            AppliedKind::Outer => (0..fields).map(|col| ColRef { rel, col }).collect(),
++            AppliedKind::Mark => vec![ColRef {
++                rel,
++                col: MARK_COLUMN,
++            }],
++        }
++    }
++
++    /// Whether the rows it is applied to carry this side's own columns afterwards, which
++    /// is what decides how wide they are. A mark join adds one boolean, not a row.
++    pub fn widens(self) -> bool {
++        matches!(self, AppliedKind::Outer)
++    }
++
++    /// Whether what this side emits depends on where its join lands: an outer join's
++    /// nulls and a mark join's flag both do.
++    pub fn depends_on_placement(self) -> bool {
++        matches!(self, AppliedKind::Outer | AppliedKind::Mark)
++    }
++}
++
++/// One leaf of the join graph: a subplan the enumerator does not look inside.
++#[derive(Debug)]
++pub struct Relation {
++    /// The subplan this relation stands for.
++    pub plan: Arc<dyn ExecutionPlan>,
++    /// Estimated row count, clamped to at least 1.
++    pub rows: f64,
++    /// Estimated bytes per row, when the input reports a size.
++    pub width: Option<f64>,
++    /// Per-column distinct value estimate, clamped to `[1, rows]`.
++    pub ndv: Vec<f64>,
++    /// What it contributes to the join.
++    pub role: Role,
++}
++
++/// One side of an equi-join predicate: the column it reads, and the expression around
++/// that column when the predicate reads more than the column itself. Coercing two sides
++/// to one type puts a cast there.
++#[derive(Clone, Debug)]
++pub struct Key {
++    /// The column it reads.
++    pub column: ColRef,
++    /// `None` when the key is that column itself.
++    pub wrapper: Option<PhysicalExprRef>,
++}
++
++impl Key {
++    fn bare(column: ColRef) -> Self {
++        Self {
++            column,
++            wrapper: None,
++        }
++    }
++
++    /// This key over `column` instead, when nothing has to be composed to say so.
++    fn wrapped(&self, wrapper: &PhysicalExprRef) -> Option<Self> {
++        self.wrapper.is_none().then(|| Self {
++            column: self.column,
++            wrapper: Some(Arc::clone(wrapper)),
++        })
++    }
++}
++
++/// An equi-join predicate `left = right` between two distinct relations.
++#[derive(Clone, Debug)]
++pub struct Edge {
++    /// The key on one side.
++    pub left: Key,
++    /// The key it is compared against.
++    pub right: Key,
++}
++
++/// A non-equi join predicate, moved along with its column references rewritten.
++#[derive(Debug)]
++pub struct Filter {
++    /// The predicate itself.
++    pub filter: JoinFilter,
++    /// The column each entry of the filter's intermediate schema comes from.
++    pub columns: Vec<ColRef>,
++    /// The relations those columns belong to.
++    pub required: RelSet,
++}
++
++/// A connected set of joins as relations plus the predicates between them.
++#[derive(Debug)]
++pub struct JoinGraph {
++    /// The leaves, addressed by index throughout.
++    pub relations: Vec<Relation>,
++    /// The equi-join predicates between them.
++    pub edges: Vec<Edge>,
++    /// The non-equi predicates between them.
++    pub filters: Vec<Filter>,
++    /// Columns the original subtree emitted; the rebuilt one reproduces this exactly.
++    pub output: Vec<ColRef>,
++    /// Null handling shared by the subtree's joins. A join that differs becomes a
++    /// relation instead.
++    pub null_equality: Option<NullEquality>,
++    /// The original tree's internal nodes as `(node, one child)`, children first, so
++    /// the planner's shape can be scored under the same formula as the alternatives.
++    pub original_nodes: Vec<(RelSet, RelSet)>,
++    /// The relations that are applied to others rather than joined freely.
++    pub applied: RelSet,
++    /// Which join operator the subtree used, and which the rebuild emits.
++    pub kind: Option<JoinKind>,
++}
++
++impl JoinGraph {
++    /// Distinct values estimated for one column.
++    pub fn ndv(&self, col: ColRef) -> f64 {
++        self.relations[col.rel].ndv[col.col]
++    }
++
++    /// Every relation in the graph.
++    pub fn all(&self) -> RelSet {
++        (0..self.relations.len()).fold(0, |mask, rel| mask | bit(rel))
++    }
++
++    /// How `rel` applies to the side it is applied to, if it is applied at all.
++    pub fn applied(&self, rel: usize) -> Option<&Applied> {
++        match &self.relations[rel].role {
++            Role::Applied(applied) => Some(applied),
++            Role::Output => None,
++        }
++    }
++
++    /// The relations whose emitted columns depend on where their join lands: an outer
++    /// join's nulls and a mark join's flag.
++    pub fn placement_dependent(&self) -> RelSet {
++        (0..self.relations.len())
++            .filter(|rel| {
++                self.applied(*rel)
++                    .is_some_and(|applied| applied.kind.depends_on_placement())
++            })
++            .fold(0, |mask, rel| mask | bit(rel))
++    }
++
++    /// The operator the rebuild emits, defaulting to a hash join.
++    pub fn kind(&self) -> JoinKind {
++        self.kind.unwrap_or(JoinKind::Hash)
++    }
++
++    /// The null handling the rebuild emits, defaulting to `NullEqualsNothing`.
++    pub fn null_equality(&self) -> NullEquality {
++        self.null_equality
++            .unwrap_or(NullEquality::NullEqualsNothing)
++    }
++}
++
++/// The join operators the rule can flatten and rebuild.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum JoinKind {
++    /// Rebuilt as a [`HashJoinExec`].
++    Hash,
++    /// Rebuilt as a [`SortMergeJoinExec`], which has no built-in projection, so the
++    /// subtree gets one projection on top instead.
++    SortMerge,
++}
++
++/// One join, seen the same way whichever operator implements it. `kind` and
++/// `null_equality` are `None` for operators without equi-join keys.
++struct JoinView<'a> {
++    kind: Option<JoinKind>,
++    role: JoinRole,
++    left: &'a Arc<dyn ExecutionPlan>,
++    right: &'a Arc<dyn ExecutionPlan>,
++    on: &'a [(PhysicalExprRef, PhysicalExprRef)],
++    filter: Option<&'a JoinFilter>,
++    null_equality: Option<NullEquality>,
++    projection: Option<&'a [usize]>,
++}
++
++fn join_view(plan: &Arc<dyn ExecutionPlan>) -> Option<JoinView<'_>> {
++    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
++        if join.null_aware || join.fetch().is_some() || join.on().is_empty() {
++            return None;
++        }
++        return Some(JoinView {
++            kind: Some(JoinKind::Hash),
++            role: join_role(join.join_type(), join.filter().is_some())?,
++            left: join.left(),
++            right: join.right(),
++            on: join.on(),
++            filter: join.filter(),
++            null_equality: Some(join.null_equality),
++            projection: join.projection.as_deref(),
++        });
++    }
++    if let Some(join) = plan.downcast_ref::<SortMergeJoinExec>() {
++        if join.on().is_empty() {
++            return None;
++        }
++        return Some(JoinView {
++            kind: Some(JoinKind::SortMerge),
++            role: join_role(&join.join_type(), join.filter().is_some())?,
++            left: join.left(),
++            right: join.right(),
++            on: join.on(),
++            filter: join.filter().as_ref(),
++            null_equality: Some(join.null_equality()),
++            projection: None,
++        });
++    }
++    if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
++        // A semi, anti or outer variant has no keys to apply it by.
++        if *join.join_type() != JoinType::Inner {
++            return None;
++        }
++        return Some(JoinView {
++            kind: None,
++            role: JoinRole::Inner,
++            left: join.left(),
++            right: join.right(),
++            on: &[],
++            filter: join.filter(),
++            null_equality: None,
++            projection: join.projection().as_deref(),
++        });
++    }
++    let join = plan.downcast_ref::<CrossJoinExec>()?;
++    Some(JoinView {
++        kind: None,
++        role: JoinRole::Inner,
++        left: join.left(),
++        right: join.right(),
++        on: &[],
++        filter: None,
++        null_equality: None,
++        projection: None,
++    })
++}
++
++/// How a join takes part in enumeration, if at all.
++#[derive(Clone, Copy, Debug)]
++enum JoinRole {
++    Inner,
++    /// One side applied to the other; `output` names the side whose rows survive, and
++    /// the other becomes an applied relation.
++    Applying {
++        kind: AppliedKind,
++        output: JoinSide,
++    },
++}
++
++/// Classifies a join. A full outer join is excluded: it leaves neither side's rows as
++/// they were, so neither side can be the one that is applied. A semi, anti, outer or mark
++/// join carrying a filter is excluded too, because the filter is part of what the join
++/// tests and would have to move with it.
++fn join_role(join_type: &JoinType, has_filter: bool) -> Option<JoinRole> {
++    let applying = |kind, output| JoinRole::Applying { kind, output };
++    let role = match join_type {
++        JoinType::Inner => JoinRole::Inner,
++        JoinType::LeftSemi => applying(AppliedKind::Semi, JoinSide::Left),
++        JoinType::RightSemi => applying(AppliedKind::Semi, JoinSide::Right),
++        JoinType::LeftAnti => applying(AppliedKind::Anti, JoinSide::Left),
++        JoinType::RightAnti => applying(AppliedKind::Anti, JoinSide::Right),
++        // A left outer join keeps its left side's rows and supplies its right side.
++        JoinType::Left => applying(AppliedKind::Outer, JoinSide::Left),
++        JoinType::Right => applying(AppliedKind::Outer, JoinSide::Right),
++        // A left mark join keeps its left side's rows and marks them.
++        JoinType::LeftMark => applying(AppliedKind::Mark, JoinSide::Left),
++        JoinType::RightMark => applying(AppliedKind::Mark, JoinSide::Right),
++        _ => return None,
++    };
++    if has_filter && !matches!(role, JoinRole::Inner) {
++        return None;
++    }
++    Some(role)
++}
++
++/// Whether a graph-wide choice and one join's are compatible.
++fn agree<T: PartialEq>(graph: Option<T>, join: Option<T>) -> bool {
++    match (graph, join) {
++        (Some(graph), Some(join)) => graph == join,
++        _ => true,
++    }
++}
++
++/// The one column an expression reads, if it reads exactly one and only casts it. A cast
++/// is what coercion puts around a join key whose two sides had different types.
++fn key_column(expr: &PhysicalExprRef) -> Option<usize> {
++    if let Some(column) = expr.downcast_ref::<Column>() {
++        return Some(column.index());
++    }
++    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
++        return key_column(cast.expr());
++    }
++    key_column(expr.downcast_ref::<TryCastExpr>()?.expr())
++}
++
++/// What one side of a join predicate reads, in terms of the relations under it.
++fn join_key(expr: &PhysicalExprRef, columns: &[Key]) -> Option<Key> {
++    let base = columns.get(key_column(expr)?)?;
++    if expr.downcast_ref::<Column>().is_some() {
++        return Some(base.clone());
++    }
++    base.wrapped(expr)
++}
++
++/// How each column a projection emits maps to its input: a column of it, or a cast of
++/// one, which is how a join key coerced to another type is computed.
++fn projected(
++    projection: &ProjectionExec,
++) -> Option<Vec<(usize, Option<PhysicalExprRef>)>> {
++    projection
++        .expr()
++        .iter()
++        .map(|proj| {
++            if let Some(column) = proj.expr.downcast_ref::<Column>() {
++                // A rename would not survive a rebuild that names columns after the
++                // relations they come from.
++                return (column.name() == proj.alias).then_some((column.index(), None));
++            }
++            Some((key_column(&proj.expr)?, Some(Arc::clone(&proj.expr))))
++        })
++        .collect()
++}
++
++/// Extracts the maximal reorderable subtree at `plan`. `None` covers every bail-out: an
++/// unmodelled join feature, a key over more than one column, missing row counts, too few
++/// or too many inputs.
++pub(crate) fn extract(
++    plan: &Arc<dyn ExecutionPlan>,
++    stats: &mut StatsFn,
++) -> Result<Option<JoinGraph>> {
++    // Start at a join, or at the pruning projection usually above one, so its column list
++    // becomes the top join's projection instead of a `ProjectionExec` above a wider join.
++    let is_root = join_view(plan).is_some()
++        || plan
++            .downcast_ref::<ProjectionExec>()
++            .is_some_and(|projection| all_alias_free_columns(projection.expr()));
++    if !is_root {
++        return Ok(None);
++    }
++    Extractor::new(stats).extract(plan)
++}
++
++struct Extractor<'a, 's> {
++    graph: JoinGraph,
++    stats: &'s mut StatsFn<'a>,
++}
++
++impl<'a, 's> Extractor<'a, 's> {
++    fn new(stats: &'s mut StatsFn<'a>) -> Self {
++        Self {
++            graph: JoinGraph {
++                relations: vec![],
++                edges: vec![],
++                filters: vec![],
++                output: vec![],
++                null_equality: None,
++                original_nodes: vec![],
++                applied: 0,
++                kind: None,
++            },
++            stats,
++        }
++    }
++
++    fn extract(mut self, plan: &Arc<dyn ExecutionPlan>) -> Result<Option<JoinGraph>> {
++        let Some((output, _)) = self.visit(plan)? else {
++            return Ok(None);
++        };
++        // A derived column would have to be computed again above the rebuilt tree.
++        let Some(output) = output
++            .iter()
++            .map(|key| key.wrapper.is_none().then_some(key.column))
++            .collect::<Option<Vec<_>>>()
++        else {
++            return Ok(None);
++        };
++        let mut graph = self.graph;
++        graph.output = output;
++
++        if graph.relations.len() < 3 {
++            return Ok(None);
++        }
++        // A filter over one relation has no join to sit at; the node would be a leaf.
++        if graph
++            .filters
++            .iter()
++            .any(|filter| filter.required.count_ones() < 2)
++        {
++            return Ok(None);
++        }
++        // Which rows of a null-supplied relation are null, and which rows a mark join
++        // marks, depend on where that join lands, so a predicate over one of those
++        // columns has to be evaluated there and cannot be moved. Rather than track that,
++        // leave the subtree alone: another predicate over such a relation, including
++        // another outer or mark join's keys, is a graph this rule does not reorder.
++        let derived = graph.placement_dependent();
++        let reaches_nulls = |mask: RelSet| mask & derived != 0;
++        let reordering_would_move_a_predicate = graph.edges.iter().any(|edge| {
++            reaches_nulls(bit(edge.left.column.rel) | bit(edge.right.column.rel))
++        }) || graph
++            .filters
++            .iter()
++            .any(|filter| reaches_nulls(filter.required))
++            || (0..graph.relations.len()).any(|rel| {
++                graph
++                    .applied(rel)
++                    .is_some_and(|applied| reaches_nulls(applied.required))
++            });
++        if reordering_would_move_a_predicate {
++            return Ok(None);
++        }
++        Ok(Some(graph))
++    }
++
++    fn visit(
++        &mut self,
++        plan: &Arc<dyn ExecutionPlan>,
++    ) -> Result<Option<(Vec<Key>, RelSet)>> {
++        if let Some(view) = join_view(plan)
++            && agree(self.graph.null_equality, view.null_equality)
++            && agree(self.graph.kind, view.kind)
++        {
++            self.graph.null_equality = self.graph.null_equality.or(view.null_equality);
++            self.graph.kind = self.graph.kind.or(view.kind);
++            let visited = match view.role {
++                JoinRole::Inner => self.visit_inner(&view)?,
++                JoinRole::Applying { kind, output } => {
++                    self.visit_applying(&view, kind, output)?
++                }
++            };
++            let Some((columns, mask)) = visited else {
++                return Ok(None);
++            };
++
++            // For a semi or anti join the projection selects from the output side alone.
++            let columns = match view.projection {
++                Some(projection) => {
++                    projection.iter().map(|idx| columns[*idx].clone()).collect()
++                }
++                None => columns,
++            };
++            Ok(Some((columns, mask)))
++        } else if let Some(projection) = plan.downcast_ref::<ProjectionExec>()
++            && let Some(slots) = projected(projection)
++        {
++            // Looking through the projections between joins lets the enumerator see a
++            // whole chain, since `ProjectionPushdown` has not folded them into the joins
++            // yet, and the ones holding a coerced join key are how casts reach it.
++            let Some((child, mask)) = self.visit(projection.input())? else {
++                return Ok(None);
++            };
++            let columns = slots
++                .iter()
++                .map(|(index, wrapper)| {
++                    let base = child.get(*index)?;
++                    match wrapper {
++                        None => Some(base.clone()),
++                        Some(wrapper) => base.wrapped(wrapper),
++                    }
++                })
++                .collect::<Option<Vec<_>>>();
++            Ok(columns.map(|columns| (columns, mask)))
++        } else {
++            let Some(rel) = self.push_relation(plan, Role::Output)? else {
++                return Ok(None);
++            };
++            Ok(Some((
++                (0..plan.schema().fields().len())
++                    .map(|col| Key::bare(ColRef { rel, col }))
++                    .collect(),
++                bit(rel),
++            )))
++        }
++    }
++
++    /// Flattens an inner join: both sides join the graph, predicates become edges
++    /// and filters.
++    fn visit_inner(&mut self, view: &JoinView) -> Result<Option<(Vec<Key>, RelSet)>> {
++        let Some((left, left_mask)) = self.visit(view.left)? else {
++            return Ok(None);
++        };
++        let Some((right, right_mask)) = self.visit(view.right)? else {
++            return Ok(None);
++        };
++
++        for (left_key, right_key) in view.on {
++            let (Some(left), Some(right)) =
++                (join_key(left_key, &left), join_key(right_key, &right))
++            else {
++                return Ok(None);
++            };
++            let edge = Edge { left, right };
++            // Duplicates would be double counted by the cost model.
++            if !self.graph.edges.iter().any(|other| {
++                (other.left.column, other.right.column)
++                    == (edge.left.column, edge.right.column)
++            }) {
++                self.graph.edges.push(edge);
++            }
++        }
++
++        if let Some(filter) = view.filter {
++            let columns = filter
++                .column_indices()
++                .iter()
++                .map(|ColumnIndex { index, side }| {
++                    let key = match side {
++                        JoinSide::Left => left.get(*index),
++                        JoinSide::Right => right.get(*index),
++                        JoinSide::None => None,
++                    }?;
++                    // A derived column would have to be computed to test the filter.
++                    key.wrapper.is_none().then_some(key.column)
++                })
++                .collect::<Option<Vec<_>>>();
++            let Some(columns) = columns else {
++                return Ok(None);
++            };
++            let required = columns.iter().fold(0, |mask, col| mask | bit(col.rel));
++            self.graph.filters.push(Filter {
++                filter: filter.clone(),
++                columns,
++                required,
++            });
++        }
++
++        let mut columns = left;
++        columns.extend(right);
++        self.graph
++            .original_nodes
++            .push((left_mask | right_mask, left_mask));
++        Ok(Some((columns, left_mask | right_mask)))
++    }
++
++    /// Flattens a join that applies one side to the other: the surviving side joins the
++    /// graph, and the side applied to it becomes one applied relation.
++    fn visit_applying(
++        &mut self,
++        view: &JoinView,
++        kind: AppliedKind,
++        output: JoinSide,
++    ) -> Result<Option<(Vec<Key>, RelSet)>> {
++        let (output_plan, applied_plan) = match output {
++            JoinSide::Left => (view.left, view.right),
++            JoinSide::Right => (view.right, view.left),
++            JoinSide::None => return internal_err!("applying join with no output side"),
++        };
++
++        let Some((columns, mask)) = self.visit(output_plan)? else {
++            return Ok(None);
++        };
++
++        // Keys resolve against the surviving side, so they precede the applied relation.
++        let mut keys = Vec::with_capacity(view.on.len());
++        let mut required = 0;
++        for (left_key, right_key) in view.on {
++            let (output_key, applied_key) = match output {
++                JoinSide::Left => (left_key, right_key),
++                _ => (right_key, left_key),
++            };
++            let (Some(other), Some(column)) =
++                (join_key(output_key, &columns), key_column(applied_key))
++            else {
++                return Ok(None);
++            };
++            required |= bit(other.column.rel);
++            keys.push(AppliedKey {
++                other,
++                column,
++                expr: Arc::clone(applied_key),
++            });
++        }
++
++        let fields = applied_plan.schema().fields().len();
++        let role = Role::Applied(Applied {
++            kind,
++            keys,
++            required,
++        });
++        let Some(rel) = self.push_relation(applied_plan, role)? else {
++            return Ok(None);
++        };
++        self.graph.original_nodes.push((mask | bit(rel), bit(rel)));
++
++        // An outer join emits both of its sides, in the order its inputs were in; a mark
++        // join emits the side it marked and then the flag.
++        let mine = kind.emitted(rel, fields).into_iter().map(Key::bare);
++        // A mark join's flag comes last whichever side it marked; an outer join's columns
++        // keep the position its input had.
++        let appended =
++            output == JoinSide::Left || kind == AppliedKind::Mark || mine.len() == 0;
++        let columns = if appended {
++            columns.into_iter().chain(mine).collect()
++        } else {
++            mine.chain(columns).collect()
++        };
++        Ok(Some((columns, mask | bit(rel))))
++    }
++
++    fn push_relation(
++        &mut self,
++        plan: &Arc<dyn ExecutionPlan>,
++        role: Role,
++    ) -> Result<Option<usize>> {
++        if plan.boundedness().is_unbounded() {
++            // Reordering could break the pipeline properties the other subrules establish.
++            return Ok(None);
++        }
++        if self.graph.relations.len() >= MAX_RELATIONS {
++            return Ok(None);
++        }
++        let statistics = (self.stats)(plan.as_ref())?;
++        let Some(rows) = statistics.num_rows.get_value().copied() else {
++            return Ok(None);
++        };
++        let rows = (rows as f64).max(1.0);
++        let ndv = statistics
++            .column_statistics
++            .iter()
++            .map(|col| {
++                max_distinct_count(&statistics.num_rows, col)
++                    .get_value()
++                    .map(|ndv| (*ndv as f64).clamp(1.0, rows))
++                    .unwrap_or(rows)
++            })
++            .collect();
++
++        let rel = self.graph.relations.len();
++        if matches!(role, Role::Applied(_)) {
++            self.graph.applied |= bit(rel);
++        }
++        self.graph.relations.push(Relation {
++            plan: Arc::clone(plan),
++            rows,
++            width: statistics
++                .total_byte_size
++                .get_value()
++                .map(|bytes| *bytes as f64 / rows),
++            ndv,
++            role,
++        });
++        Ok(Some(rel))
++    }
++}
+diff --git a/datafusion/physical-optimizer/src/join_enumeration/mod.rs b/datafusion/physical-optimizer/src/join_enumeration/mod.rs
+new file mode 100644
+index 0000000..c7278cd
+--- /dev/null
++++ b/datafusion/physical-optimizer/src/join_enumeration/mod.rs
+@@ -0,0 +1,1500 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++//! Cost-based join order enumeration.
++//!
++//! A subtree of joins is flattened into relations plus the predicates between them, a
++//! dynamic program searches the orders (bushy as well as left-deep) under a `C_out` cost
++//! model, and the subtree is rebuilt if the winner is cheaper.
++//!
++//! The estimates come from a [`JoinCostModel`], so a different one can be plugged in
++//! with [`JoinEnumeration::with_cost_model`].
++//!
++//! The graph itself, and how a subtree of joins is flattened into one, is in [`graph`].
++//!
++//! Reordering is sound because a tree of inner joins equals the cross product of its
++//! relations filtered by all its predicates. Semi, anti, outer and mark joins take part
++//! as relations applied to the set their keys come from: a semi or anti join filters that
++//! side, an outer join extends it, a mark join marks it.
++
++mod dphyp;
++pub mod graph;
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::sync::Arc;
++
++use crate::PhysicalOptimizerRule;
++use crate::optimizer::{ConfigOnlyContext, PhysicalOptimizerContext};
++
++use arrow::compute::SortOptions;
++use arrow::datatypes::{FieldRef, Schema};
++use datafusion_common::config::ConfigOptions;
++use datafusion_common::error::Result;
++use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
++use datafusion_common::{JoinSide, JoinType, internal_err};
++use datafusion_expr_common::operator::Operator;
++use datafusion_physical_expr::PhysicalExprRef;
++use datafusion_physical_expr::expressions::{BinaryExpr, Column};
++use datafusion_physical_expr::projection::ProjectionExpr;
++use datafusion_physical_plan::ExecutionPlan;
++use datafusion_physical_plan::execution_plan::replace_children_if_necessary;
++use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
++use datafusion_physical_plan::joins::{
++    CrossJoinExec, HashJoinExecBuilder, NestedLoopJoinExec, PartitionMode,
++    SortMergeJoinExec,
++};
++use datafusion_physical_plan::projection::ProjectionExec;
++use datafusion_physical_plan::operator_statistics::StatisticsRegistry;
++use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
++
++use graph::{
++    AppliedKey, AppliedKind, ColRef, Edge, Filter, JoinGraph, JoinKind, Key,
++    MAX_RELATIONS, RelSet, StatsFn, bit, covers, extract, iter_rels,
++};
++
++/// Chooses the shape of the join tree, before [`JoinSelection`] decides how each
++/// join runs.
++///
++/// [`JoinSelection`]: crate::join_selection::JoinSelection
++#[derive(Debug)]
++pub struct JoinEnumeration {
++    cost_model: Arc<dyn JoinCostModelFactory>,
++}
++
++impl JoinEnumeration {
++    #[expect(missing_docs)]
++    pub fn new() -> Self {
++        Self {
++            cost_model: Arc::new(DefaultJoinCostModelFactory {}),
++        }
++    }
++
++    /// Searches with `cost_model` in place of [`DefaultJoinCostModel`].
++    pub fn with_cost_model(mut self, cost_model: Arc<dyn JoinCostModelFactory>) -> Self {
++        self.cost_model = cost_model;
++        self
++    }
++}
++
++impl Default for JoinEnumeration {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl PhysicalOptimizerRule for JoinEnumeration {
++    fn optimize(
++        &self,
++        plan: Arc<dyn ExecutionPlan>,
++        config: &ConfigOptions,
++    ) -> Result<Arc<dyn ExecutionPlan>> {
++        self.optimize_with_context(plan, &ConfigOnlyContext::new(config))
++    }
++
++    fn optimize_with_context(
++        &self,
++        plan: Arc<dyn ExecutionPlan>,
++        context: &dyn PhysicalOptimizerContext,
++    ) -> Result<Arc<dyn ExecutionPlan>> {
++        let config = context.config_options();
++        if !config.optimizer.join_enumeration {
++            return Ok(plan);
++        }
++        // Backport to DataFusion 55.0.0: statistics come from where 55.0.0's
++        // JoinSelection takes them, the registry only with `use_statistics_registry`.
++        let mut default_registry = None;
++        let registry: Option<&StatisticsRegistry> =
++            if config.optimizer.use_statistics_registry {
++                Some(context.statistics_registry().unwrap_or_else(|| {
++                    default_registry
++                        .insert(StatisticsRegistry::default_with_builtin_providers())
++                }))
++            } else {
++                None
++            };
++        let stats_ctx = StatisticsContext::new();
++        // The cache is keyed by node pointer, and the search builds and drops
++        // candidate plans, so only reuse it within one call.
++        let mut stats = |plan: &dyn ExecutionPlan| match registry {
++            Some(reg) => reg
++                .compute(plan)
++                .map(|s| Arc::<datafusion_common::Statistics>::clone(s.base_arc())),
++            None => {
++                stats_ctx.reset_cache();
++                stats_ctx.compute(plan, &StatisticsArgs::new())
++            }
++        };
++        Ok(
++            enumerate_join_order(&plan, config, &mut stats, self.cost_model.as_ref())?
++                .unwrap_or(plan),
++        )
++    }
++
++    fn name(&self) -> &str {
++        "join_enumeration"
++    }
++
++    fn schema_check(&self) -> bool {
++        true
++    }
++}
++
++/// A hash partitioning, as the set of key classes it is partitioned on. Zero means
++/// not hash partitioned, which is where every scan starts.
++pub type PartSet = u32;
++
++/// A valid way of combining two relation sets.
++#[derive(Clone, Copy, Debug)]
++pub enum Combine {
++    /// An inner join, both sides contributing their columns.
++    Inner,
++    /// A semi, anti or outer join applying `applied` to the opposite set.
++    Applied {
++        /// The applied relation, which is the whole of its side.
++        applied: usize,
++    },
++}
++
++/// One way of exchanging a join's inputs: what the exchange costs, the partitioning it
++/// leaves the output in, the side that builds, and the mode the join runs in.
++#[derive(Clone, Copy, Debug)]
++pub struct Exchange {
++    /// Cost of moving the inputs, in the unit [`JoinCostModel::cardinality`] counts in.
++    pub cost: f64,
++    /// The partitioning the join's output is left in, for a join above to reuse.
++    pub partitioning: PartSet,
++    /// The side that builds: what `CollectLeft` collects, or which side is hashed.
++    pub build: RelSet,
++    /// The mode the join is costed under, which is the one the rebuild emits.
++    pub mode: PartitionMode,
++}
++
++/// Cardinality and cost estimates over the subsets of a [`JoinGraph`], which is all the
++/// search knows about the data.
++///
++/// [`DefaultJoinCostModel`] derives them from the statistics the subtree's inputs report.
++/// Implement this trait, and hand it to [`JoinEnumeration::with_cost_model`], to search
++/// under other estimates: statistics kept outside the plan, a different cost function, or
++/// knowledge of the data the plan has no way to carry.
++pub trait JoinCostModel {
++    /// Estimated rows from joining every relation in `mask`.
++    ///
++    /// Must depend on the set alone and not on the order its relations were joined in:
++    /// that is what makes the dynamic program valid. Should stay at or above `1.0`, since
++    /// the search multiplies cardinalities.
++    fn cardinality(&self, mask: RelSet) -> f64;
++
++    /// Whether `left` and `right` can be combined, and how: as an inner join, or with one
++    /// side applied to the other. `None` prunes the pair from the search, which is what
++    /// keeps a cut no predicate spans, or an applied side whose keys the other does not
++    /// supply, out of the plan.
++    fn combine(&self, left: RelSet, right: RelSet) -> Option<Combine>;
++
++    /// Ways of exchanging the inputs of a join of `left` (partitioned as `left_part`)
++    /// with `right` (`right_part`), appended to `into`. Appending several lets the search
++    /// carry each partitioning forward and keep whichever pays off at the joins above;
++    /// appending none prunes the pair. `into` arrives empty and is reused between calls,
++    /// which is why this appends rather than returns.
++    ///
++    /// `collect_only` is the side that must build, when the combination forces one.
++    fn exchanges(
++        &self,
++        left: RelSet,
++        right: RelSet,
++        left_part: PartSet,
++        right_part: PartSet,
++        collect_only: Option<RelSet>,
++        into: &mut Vec<Exchange>,
++    );
++
++    /// The key classes a join above `mask` could still hash on. A plan left partitioned on
++    /// anything else is not worth keeping apart from the cheapest one, since nothing above
++    /// can reuse it, and the search then keeps one plan for `mask` instead of several.
++    /// Every class, by default.
++    fn reusable(&self, _mask: RelSet) -> PartSet {
++        PartSet::MAX
++    }
++
++    /// Cost of a whole tree, given its internal nodes as `(node, one child)`, children
++    /// first. The search scores its own candidates this way, so the shape the planner
++    /// produced can be compared against them.
++    fn tree_cost(&self, nodes: &[(RelSet, RelSet)]) -> f64 {
++        let mut parts: HashMap<RelSet, PartSet> = HashMap::new();
++        let mut total = 0.0;
++        for (mask, child) in nodes {
++            if mask.count_ones() < 2 {
++                continue;
++            }
++            let other = mask ^ child;
++            let (child_part, other_part) = (
++                parts.get(child).copied().unwrap_or(0),
++                parts.get(&other).copied().unwrap_or(0),
++            );
++            let collect_only = collect_only(self.combine(*child, other));
++            let mut exchanges = vec![];
++            self.exchanges(
++                *child,
++                other,
++                child_part,
++                other_part,
++                collect_only,
++                &mut exchanges,
++            );
++            let best = exchanges
++                .into_iter()
++                .min_by(|a, b| a.cost.total_cmp(&b.cost));
++            let (exchange, part) =
++                best.map_or((0.0, 0), |best| (best.cost, best.partitioning));
++            total += self.cardinality(*mask) + exchange;
++            parts.insert(*mask, part);
++        }
++        total
++    }
++}
++
++/// The side a combination forces to build: an applied relation is hashed so the side it
++/// applies to can stream.
++fn collect_only(combine: Option<Combine>) -> Option<RelSet> {
++    match combine {
++        Some(Combine::Applied { applied }) => Some(bit(applied)),
++        _ => None,
++    }
++}
++
++/// Builds the [`JoinCostModel`] for one join subtree.
++pub trait JoinCostModelFactory: std::fmt::Debug + Send + Sync {
++    /// Creates a cost model over `graph`.
++    fn create<'graph>(
++        &self,
++        graph: &'graph JoinGraph,
++        config: &ConfigOptions,
++    ) -> Result<Box<dyn JoinCostModel + 'graph>>;
++}
++
++/// Hands out [`DefaultJoinCostModel`], which the rule searches with unless it was given
++/// another factory.
++#[derive(Debug, Default)]
++pub struct DefaultJoinCostModelFactory {}
++
++impl JoinCostModelFactory for DefaultJoinCostModelFactory {
++    fn create<'graph>(
++        &self,
++        graph: &'graph JoinGraph,
++        config: &ConfigOptions,
++    ) -> Result<Box<dyn JoinCostModel + 'graph>> {
++        Ok(Box::new(DefaultJoinCostModel::new(graph, config)))
++    }
++}
++
++/// The built-in [`JoinCostModel`]: a `C_out` model over the row counts, distinct counts
++/// and widths the subtree's inputs report.
++pub struct DefaultJoinCostModel<'a> {
++    graph: &'a JoinGraph,
++    /// What each joined relation pair divides the row count by, largest first.
++    denominators: Vec<Denominator>,
++    /// The relations each equality holds between. A pair may only be counted as long as
++    /// its equality has pairs left to spend.
++    equalities: Vec<RelSet>,
++    /// Neighbours of each relation, over equi-join keys and non-equi filters alike.
++    /// An applied relation neighbours nothing: it is applied rather than joined.
++    adjacency: Vec<RelSet>,
++    /// The relations of each connected component of `adjacency`.
++    components: Vec<RelSet>,
++    /// What applying a relation does to the row count of the side it applies to: the
++    /// fraction a semi or anti join keeps, or the rows an outer join leaves per row.
++    /// `1.0` for a relation that is not applied.
++    applied_factor: Vec<f64>,
++    /// Selectivity of each non-equi filter, with the relations it needs.
++    filter_selectivity: Vec<(RelSet, f64)>,
++    /// The key class of each edge, as a bit position. Joins on the same class can
++    /// reuse each other's hash partitioning.
++    edge_class: Vec<u32>,
++    /// The relations each key class joins, by that bit position.
++    class_relations: Vec<RelSet>,
++    /// The size a build side must stay under for `JoinSelection` to broadcast it.
++    broadcast_bytes: f64,
++    /// The row count it must stay under when no byte estimate is available.
++    broadcast_rows: f64,
++    /// Row counts already estimated, since `exchanges` asks for its inputs' repeatedly.
++    /// `NaN` where not yet estimated.
++    estimated: RefCell<Vec<f64>>,
++}
++
++impl<'a> DefaultJoinCostModel<'a> {
++    /// Precomputes the selectivities and connectivity of `graph`.
++    pub fn new(graph: &'a JoinGraph, config: &ConfigOptions) -> Self {
++        let mut adjacency = vec![0; graph.relations.len()];
++        for edge in &graph.edges {
++            let (a, b) = (edge.left.column.rel, edge.right.column.rel);
++            adjacency[a] |= bit(b);
++            adjacency[b] |= bit(a);
++        }
++        let (denominators, equalities) = denominators(graph);
++
++        let edge_class: Vec<u32> = key_classes(&graph.edges)
++            .iter()
++            .map(|class| (*class).min(PartSet::BITS as usize - 1) as u32)
++            .collect();
++        let mut class_relations = vec![0 as RelSet; PartSet::BITS as usize];
++        for (edge, class) in graph.edges.iter().zip(&edge_class) {
++            class_relations[*class as usize] |=
++                bit(edge.left.column.rel) | bit(edge.right.column.rel);
++        }
++
++        let applied_factor = (0..graph.relations.len())
++            .map(|rel| {
++                let Some(applied) = graph.applied(rel) else {
++                    return 1.0;
++                };
++                let mine = |key: &AppliedKey| {
++                    graph.ndv(ColRef {
++                        rel,
++                        col: key.column,
++                    })
++                };
++                match applied.kind {
++                    // A mark join adds a column, not rows.
++                    AppliedKind::Mark => 1.0,
++                    // The fraction of the other side's key values this one covers.
++                    AppliedKind::Semi | AppliedKind::Anti => {
++                        let matched = applied
++                            .keys
++                            .iter()
++                            .map(|key| {
++                                (mine(key) / graph.ndv(key.other.column)).clamp(0.0, 1.0)
++                            })
++                            .fold(1.0f64, f64::min);
++                        if applied.kind == AppliedKind::Anti {
++                            1.0 - matched
++                        } else {
++                            matched
++                        }
++                    }
++                    // Rows per row of the side it extends, as an inner join would count
++                    // them, but never below the one an unmatched row keeps.
++                    AppliedKind::Outer => {
++                        let denominator = iter_rels(applied.required)
++                            .map(|other| {
++                                applied
++                                    .keys
++                                    .iter()
++                                    .filter(|key| key.other.column.rel == other)
++                                    .map(|key| mine(key).max(graph.ndv(key.other.column)))
++                                    .fold(1.0f64, f64::max)
++                            })
++                            .product::<f64>();
++                        (graph.relations[rel].rows / denominator.max(1.0)).max(1.0)
++                    }
++                }
++            })
++            .collect();
++
++        // A non-equi filter has no statistics, so it takes the optimizer's default.
++        let default_selectivity =
++            f64::from(config.optimizer.default_filter_selectivity) / 100.0;
++        let filter_selectivity = graph
++            .filters
++            .iter()
++            .map(|filter| (filter.required, default_selectivity))
++            .collect();
++
++        // A filter links what it references, so a pair joined only by one counts as
++        // connected and its cuts prune like any other.
++        for filter in &graph.filters {
++            for rel in iter_rels(filter.required) {
++                adjacency[rel] |= filter.required & !bit(rel);
++            }
++        }
++
++        let mut components: Vec<RelSet> = vec![];
++        let mut seen: RelSet = 0;
++        for rel in 0..graph.relations.len() {
++            if seen & bit(rel) != 0 {
++                continue;
++            }
++            let mut component = bit(rel);
++            loop {
++                let grown = iter_rels(component)
++                    .fold(component, |mask, rel| mask | adjacency[rel]);
++                if grown == component {
++                    break;
++                }
++                component = grown;
++            }
++            seen |= component;
++            components.push(component);
++        }
++
++        Self {
++            graph,
++            denominators,
++            equalities,
++            adjacency,
++            components,
++            edge_class,
++            class_relations,
++            broadcast_bytes: config.optimizer.hash_join_single_partition_threshold as f64,
++            broadcast_rows: config.optimizer.hash_join_single_partition_threshold_rows
++                as f64,
++            estimated: RefCell::new(vec![f64::NAN; 1usize << graph.relations.len()]),
++            applied_factor,
++            filter_selectivity,
++        }
++    }
++
++    fn connected(&self, left: RelSet, right: RelSet) -> bool {
++        iter_rels(left).any(|rel| self.adjacency[rel] & right != 0)
++    }
++
++    /// The key classes joining `left` to `right`, which a partitioned join hashes both
++    /// sides on.
++    fn crossing_classes(&self, left: RelSet, right: RelSet) -> PartSet {
++        let mut classes = 0;
++        for (index, edge) in self.graph.edges.iter().enumerate() {
++            let (a, b) = (bit(edge.left.column.rel), bit(edge.right.column.rel));
++            if (left & a != 0 && right & b != 0) || (left & b != 0 && right & a != 0) {
++                classes |= 1 << self.edge_class[index];
++            }
++        }
++        classes
++    }
++
++    /// Whether `JoinSelection` will broadcast this side rather than partition it, by the
++    /// same bytes-or-rows test it uses. A sort merge join has no mode that collects.
++    fn broadcasts(&self, side: RelSet) -> bool {
++        if self.graph.kind() == JoinKind::SortMerge {
++            return false;
++        }
++        let mut width = 0.0;
++        for rel in iter_rels(side) {
++            // Only an outer join leaves the rows it is applied to carrying this side's
++            // columns, so only its width counts.
++            if self
++                .graph
++                .applied(rel)
++                .is_some_and(|applied| !applied.kind.widens())
++            {
++                continue;
++            }
++            match self.graph.relations[rel].width {
++                Some(bytes) => width += bytes,
++                None => return self.cardinality(side) < self.broadcast_rows,
++            }
++        }
++        self.cardinality(side) * width < self.broadcast_bytes
++    }
++}
++
++impl JoinCostModel for DefaultJoinCostModel<'_> {
++    /// Rows are the product of the relations' row counts, cut by the selectivity of
++    /// every predicate the set closes over.
++    fn cardinality(&self, mask: RelSet) -> f64 {
++        let known = self.estimated.borrow()[mask as usize];
++        if !known.is_nan() {
++            return known;
++        }
++        let rows = self.estimate(mask);
++        self.estimated.borrow_mut()[mask as usize] = rows;
++        rows
++    }
++    fn combine(&self, left: RelSet, right: RelSet) -> Option<Combine> {
++        let applied_relations = self.graph.applied;
++        // A lone applied relation is applied to the other side, which must supply its
++        // keys.
++        for (side, other) in [(right, left), (left, right)] {
++            if side.is_power_of_two() && side & applied_relations != 0 {
++                let applied = side.trailing_zeros() as usize;
++                let required = self.graph.applied(applied)?.required;
++                return covers(other, required).then_some(Combine::Applied { applied });
++            }
++        }
++        // Otherwise both sides must be joinable on their own. An unconnected cut is a
++        // cross product, allowed only between whole components, which is the only way to
++        // join a disconnected graph.
++        if left & !applied_relations == 0 || right & !applied_relations == 0 {
++            return None;
++        }
++        let separates_components = self
++            .components
++            .iter()
++            .all(|component| component & left == 0 || component & right == 0);
++        (self.connected(left, right) || separates_components).then_some(Combine::Inner)
++    }
++
++    /// A class whose relations are all joined already cannot be hashed on again.
++    fn reusable(&self, mask: RelSet) -> PartSet {
++        let mut classes = 0;
++        for (class, relations) in self.class_relations.iter().enumerate() {
++            if relations & !mask != 0 {
++                classes |= 1 << class;
++            }
++        }
++        classes
++    }
++
++    /// A side already hashed on the join key is not moved again, so the cost of an
++    /// exchange depends on what the joins below left behind.
++    fn exchanges(
++        &self,
++        left: RelSet,
++        right: RelSet,
++        left_part: PartSet,
++        right_part: PartSet,
++        collect_only: Option<RelSet>,
++        into: &mut Vec<Exchange>,
++    ) {
++        let classes = self.crossing_classes(left, right);
++        // Without a key every pair is examined, which the output cardinality does not
++        // show: a filter estimated to keep few rows still compares all of them.
++        let pairs = if classes == 0 {
++            self.cardinality(left) * self.cardinality(right)
++        } else {
++            0.0
++        };
++        for (build, probe_part) in [(left, right_part), (right, left_part)] {
++            if collect_only.is_some_and(|only| only != build) {
++                continue;
++            }
++            // With no key there is nothing to hash on, so a side must be collected.
++            if classes == 0 || self.broadcasts(build) {
++                into.push(Exchange {
++                    cost: pairs + self.cardinality(build),
++                    partitioning: probe_part,
++                    build,
++                    mode: PartitionMode::CollectLeft,
++                });
++            }
++        }
++        if classes != 0 {
++            let mut moved = 0.0;
++            if left_part != classes {
++                moved += self.cardinality(left);
++            }
++            if right_part != classes {
++                moved += self.cardinality(right);
++            }
++            let build = collect_only.unwrap_or_else(|| {
++                if self.cardinality(left) <= self.cardinality(right) {
++                    left
++                } else {
++                    right
++                }
++            });
++            into.push(Exchange {
++                cost: moved,
++                partitioning: classes,
++                build,
++                mode: PartitionMode::Partitioned,
++            });
++        }
++    }
++}
++
++impl DefaultJoinCostModel<'_> {
++    /// Rows from joining every relation in `mask`, before memoizing.
++    fn estimate(&self, mask: RelSet) -> f64 {
++        let mut rows = 1.0;
++        for rel in iter_rels(mask) {
++            // An applied relation contributes a factor, not its own rows.
++            rows *= match self.graph.applied(rel) {
++                Some(_) => self.applied_factor[rel],
++                None => self.graph.relations[rel].rows,
++            };
++        }
++        // An equality between `k` relations is one predicate however many pairs write it,
++        // so it may divide at most `k - 1` times: the largest denominators, since a
++        // predicate is at its most selective where it joins the most distinct values.
++        let mut budget: Vec<u32> = self
++            .equalities
++            .iter()
++            .map(|relations| (relations & mask).count_ones().saturating_sub(1))
++            .collect();
++        for denominator in &self.denominators {
++            if covers(mask, denominator.pair) && budget[denominator.equality] > 0 {
++                budget[denominator.equality] -= 1;
++                rows /= denominator.denominator;
++            }
++        }
++        for (required, selectivity) in &self.filter_selectivity {
++            if covers(mask, *required) {
++                rows *= selectivity;
++            }
++        }
++        rows.max(1.0)
++    }
++}
++
++/// What one joined relation pair divides the row count by.
++struct Denominator {
++    /// The two relations, as a mask.
++    pair: RelSet,
++    /// Their most selective key's distinct count.
++    denominator: f64,
++    /// Index into the equalities, of the one that key belongs to.
++    equality: usize,
++}
++
++/// What each joined relation pair divides by, largest first, and the relations each
++/// equality holds between. Predicates sharing a column state one equality however many
++/// pairs write it, which is what keeps `k` relations joined on one key from dividing
++/// `k * (k - 1) / 2` times instead of `k - 1`.
++fn denominators(graph: &JoinGraph) -> (Vec<Denominator>, Vec<RelSet>) {
++    let classes = key_classes(&graph.edges);
++    let mut equalities = vec![0; classes.iter().max().map_or(0, |last| last + 1)];
++    // Denominate each pair by its most selective key, as `estimate_inner_join_cardinality`
++    // does, so the two models agree on a pair.
++    let mut pairs: HashMap<RelSet, (f64, usize)> = HashMap::new();
++    for (edge, class) in graph.edges.iter().zip(&classes) {
++        let (a, b) = (edge.left.column.rel, edge.right.column.rel);
++        equalities[*class] |= bit(a) | bit(b);
++        let ndv = graph
++            .ndv(edge.left.column)
++            .max(graph.ndv(edge.right.column))
++            .max(1.0);
++        pairs
++            .entry(bit(a) | bit(b))
++            .and_modify(|current| {
++                if ndv > current.0 {
++                    *current = (ndv, *class);
++                }
++            })
++            .or_insert((ndv, *class));
++    }
++
++    let mut denominators: Vec<Denominator> = pairs
++        .into_iter()
++        .map(|(pair, (denominator, equality))| Denominator {
++            pair,
++            denominator,
++            equality,
++        })
++        .collect();
++    // `HashMap` iteration order is not deterministic, but plans must be.
++    denominators.sort_unstable_by(|a, b| {
++        b.denominator
++            .total_cmp(&a.denominator)
++            .then(a.pair.cmp(&b.pair))
++    });
++    (denominators, equalities)
++}
++
++/// Groups equi-join predicates that share a column, so two joins on the same group state
++/// one equality and can reuse one hash partitioning.
++fn key_classes(edges: &[Edge]) -> Vec<usize> {
++    let mut ids: Vec<usize> = (0..edges.len()).collect();
++    let shares = |a: &Edge, b: &Edge| {
++        [a.left.column, a.right.column]
++            .iter()
++            .any(|col| *col == b.left.column || *col == b.right.column)
++    };
++    loop {
++        let mut merged = false;
++        for i in 0..edges.len() {
++            for j in (i + 1)..edges.len() {
++                if ids[i] != ids[j] && shares(&edges[i], &edges[j]) {
++                    let (keep, drop) = (ids[i].min(ids[j]), ids[i].max(ids[j]));
++                    ids.iter_mut()
++                        .filter(|id| **id == drop)
++                        .for_each(|id| *id = keep);
++                    merged = true;
++                }
++            }
++        }
++        if !merged {
++            break;
++        }
++    }
++    let mut compact = ids.clone();
++    compact.sort_unstable();
++    compact.dedup();
++    ids.iter()
++        .map(|id| compact.iter().position(|c| c == id).unwrap_or(0))
++        .collect()
++}
++
++/// The winning join tree: per internal node, which input goes on the left and how the
++/// join exchanges its data.
++struct Solution {
++    nodes: HashMap<RelSet, (RelSet, PartitionMode)>,
++    cost: f64,
++}
++
++/// One plan for one relation subset: what it costs, the partitioning it leaves behind,
++/// and the join that got there.
++#[derive(Clone, Copy)]
++struct Plan {
++    partitioning: PartSet,
++    cost: f64,
++    /// The set that goes on the left, and the one that builds.
++    left: RelSet,
++    build: RelSet,
++    mode: PartitionMode,
++}
++
++/// The dynamic program's table: per relation subset, the cheapest plan for each
++/// partitioning it can be left in. Carrying the partitioning lets a later join reuse an
++/// earlier one's exchange instead of paying for another. A subset is left in only a few
++/// partitionings, so the plans are scanned rather than hashed.
++struct DpTable<'a> {
++    model: &'a dyn JoinCostModel,
++    plans: Vec<Vec<Plan>>,
++    /// Cardinalities already asked for, since many pairs share one union.
++    cardinality: Vec<f64>,
++    /// The same for the partitionings still worth telling apart, `None` until asked.
++    reusable: Vec<Option<PartSet>>,
++    /// Reused by every call to [`JoinCostModel::exchanges`].
++    exchanges: Vec<Exchange>,
++}
++
++impl<'a> DpTable<'a> {
++    fn new(model: &'a dyn JoinCostModel, relations: usize) -> Self {
++        let subsets = 1usize << relations;
++        let mut plans = vec![vec![]; subsets];
++        // A scan arrives hash partitioned on nothing.
++        for rel in 0..relations {
++            plans[bit(rel) as usize].push(Plan {
++                partitioning: 0,
++                cost: 0.0,
++                left: 0,
++                build: 0,
++                mode: PartitionMode::Auto,
++            });
++        }
++        Self {
++            model,
++            plans,
++            cardinality: vec![f64::NAN; subsets],
++            reusable: vec![None; subsets],
++            exchanges: vec![],
++        }
++    }
++
++    /// Whether any plan is known for `mask`.
++    fn planned(&self, mask: RelSet) -> bool {
++        !self.plans[mask as usize].is_empty()
++    }
++
++    fn cardinality(&mut self, mask: RelSet) -> f64 {
++        if self.cardinality[mask as usize].is_nan() {
++            self.cardinality[mask as usize] = self.model.cardinality(mask);
++        }
++        self.cardinality[mask as usize]
++    }
++
++    fn reusable(&mut self, mask: RelSet) -> PartSet {
++        *self.reusable[mask as usize].get_or_insert_with(|| self.model.reusable(mask))
++    }
++
++    /// The cheapest plan for `mask`, and among equally cheap ones the same plan every
++    /// time, so the tree does not depend on the order the search reached it in.
++    fn cheapest(&self, mask: RelSet) -> Option<&Plan> {
++        self.plans[mask as usize].iter().min_by(|a, b| {
++            a.cost
++                .total_cmp(&b.cost)
++                .then(a.partitioning.cmp(&b.partitioning))
++        })
++    }
++
++    /// Costs joining `left` with `right`, keeping the result if it beats their union's.
++    fn join(&mut self, left: RelSet, right: RelSet) {
++        let combine = self.model.combine(left, right);
++        if combine.is_none() {
++            return;
++        }
++        let collect_only = collect_only(combine);
++        let mask = left | right;
++        let cardinality = self.cardinality(mask);
++        let reusable = self.reusable(mask);
++        // Taken out so the halves can be read while the union is filled.
++        let mut plans = std::mem::take(&mut self.plans[mask as usize]);
++        let mut exchanges = std::mem::take(&mut self.exchanges);
++        for left_plan in &self.plans[left as usize] {
++            for right_plan in &self.plans[right as usize] {
++                let below = left_plan.cost + right_plan.cost + cardinality;
++                exchanges.clear();
++                self.model.exchanges(
++                    left,
++                    right,
++                    left_plan.partitioning,
++                    right_plan.partitioning,
++                    collect_only,
++                    &mut exchanges,
++                );
++                for exchange in &exchanges {
++                    let candidate = Plan {
++                        // A partitioning nothing above can match is worth no more than
++                        // none at all, and plans then merge instead of multiplying.
++                        partitioning: if exchange.partitioning & !reusable == 0 {
++                            exchange.partitioning
++                        } else {
++                            0
++                        },
++                        cost: below + exchange.cost,
++                        left,
++                        build: exchange.build,
++                        mode: exchange.mode,
++                    };
++                    match plans
++                        .iter_mut()
++                        .find(|plan| plan.partitioning == candidate.partitioning)
++                    {
++                        // Orders often tie; breaking the tie on the sets rather than on
++                        // which was reached first keeps the plan independent of that.
++                        Some(plan) => {
++                            if candidate.cost < plan.cost
++                                || (candidate.cost == plan.cost && left > plan.left)
++                            {
++                                *plan = candidate;
++                            }
++                        }
++                        None => plans.push(candidate),
++                    }
++                }
++            }
++        }
++        self.exchanges = exchanges;
++        self.plans[mask as usize] = plans;
++    }
++
++    /// The cheapest tree over every relation, if the search reached one.
++    fn solution(&self, full: RelSet) -> Option<Solution> {
++        let winner = self.cheapest(full)?;
++
++        // Walk the winning tree, keeping the left input and mode of each node it uses.
++        let mut nodes = HashMap::new();
++        let mut stack = vec![(full, winner.partitioning)];
++        while let Some((mask, partitioning)) = stack.pop() {
++            if mask.count_ones() < 2 {
++                continue;
++            }
++            let Some(plan) = self.plans[mask as usize]
++                .iter()
++                .find(|plan| plan.partitioning == partitioning)
++            else {
++                continue;
++            };
++            // The build side goes on the left: that is the side `CollectLeft` gathers.
++            nodes.insert(mask, (plan.build, plan.mode));
++            for child in [plan.left, mask ^ plan.left] {
++                let child_part = self.cheapest(child).map_or(0, |plan| plan.partitioning);
++                stack.push((child, child_part));
++            }
++        }
++
++        Some(Solution {
++            nodes,
++            cost: winner.cost,
++        })
++    }
++}
++
++fn position(columns: &[ColRef], col: ColRef) -> Option<usize> {
++    columns.iter().position(|candidate| *candidate == col)
++}
++
++fn push_unique(columns: &mut Vec<ColRef>, col: ColRef) {
++    if position(columns, col).is_none() {
++        columns.push(col);
++    }
++}
++
++fn extend_required(columns: &mut Vec<ColRef>, wanted: &[ColRef], side: RelSet) {
++    for col in wanted.iter().filter(|col| side & bit(col.rel) != 0) {
++        push_unique(columns, *col);
++    }
++}
++
++struct Rebuilder<'a> {
++    graph: &'a JoinGraph,
++    model: &'a dyn JoinCostModel,
++    solution: &'a Solution,
++    /// Each relation's plan, already rewritten if it held a join subtree.
++    relations: &'a [Arc<dyn ExecutionPlan>],
++}
++
++impl Rebuilder<'_> {
++    fn node(
++        &self,
++        mask: RelSet,
++        required: &[ColRef],
++    ) -> Result<(Arc<dyn ExecutionPlan>, Vec<ColRef>)> {
++        if mask.is_power_of_two() {
++            // A single relation, opaque here; narrowing is `ProjectionPushdown`'s job.
++            let rel = mask.trailing_zeros() as usize;
++            let plan = Arc::clone(&self.relations[rel]);
++            let columns = (0..plan.schema().fields().len())
++                .map(|col| ColRef { rel, col })
++                .collect();
++            return Ok((plan, columns));
++        }
++
++        let Some(&(left, mode)) = self.solution.nodes.get(&mask) else {
++            return internal_err!("join enumeration produced no split for {mask:b}");
++        };
++        let right = mask ^ left;
++        match self.model.combine(left, right) {
++            None => internal_err!("join enumeration produced an invalid join"),
++            Some(Combine::Applied { applied }) => {
++                self.applying(mask, required, applied, mode)
++            }
++            // The search chose the build side and the mode along with the order, so both
++            // are emitted as decided rather than left to `JoinSelection`.
++            Some(Combine::Inner) => self.inner(required, left, right, mode),
++        }
++    }
++
++    /// Builds one join of the kind the subtree used.
++    fn build_join(
++        &self,
++        left: Built,
++        right: Built,
++        spec: JoinSpec,
++        required: &[ColRef],
++    ) -> Result<(Arc<dyn ExecutionPlan>, Vec<ColRef>)> {
++        let JoinSpec {
++            on,
++            join_type,
++            filter,
++            mode,
++        } = spec;
++        // A semi or anti join emits one side, and the applied side's own columns are
++        // not emitted, so its `Built` carries none.
++        let natural = match join_type {
++            JoinType::RightSemi | JoinType::RightAnti => right.columns.clone(),
++            // A mark join emits the side it marked and then the flag, which is the one
++            // column the marking side contributes.
++            JoinType::RightMark => {
++                right.columns.iter().chain(&left.columns).copied().collect()
++            }
++            JoinType::LeftSemi | JoinType::LeftAnti => left.columns.clone(),
++            _ => {
++                let mut natural = left.columns.clone();
++                natural.extend(right.columns.clone());
++                natural
++            }
++        };
++        let keys = on.len();
++        if keys == 0 {
++            // No keys: with a filter this is a nested loop join, without one a cross
++            // join.
++            let projection = projection_for(required, &natural)?;
++            return match filter {
++                Some(filter) => {
++                    let join = NestedLoopJoinExec::try_new(
++                        left.plan,
++                        right.plan,
++                        Some(filter),
++                        &join_type,
++                        projection.clone(),
++                    )?;
++                    // `projection_for` is `None` only for the identity.
++                    let emitted = match projection {
++                        Some(_) => required.to_vec(),
++                        None => natural,
++                    };
++                    Ok((Arc::new(join), emitted))
++                }
++                // A cross join has no projection of its own.
++                None => {
++                    Ok((Arc::new(CrossJoinExec::new(left.plan, right.plan)), natural))
++                }
++            };
++        }
++        match self.graph.kind() {
++            JoinKind::Hash => {
++                let join = HashJoinExecBuilder::new(left.plan, right.plan, on, join_type)
++                    .with_filter(filter)
++                    .with_null_equality(self.graph.null_equality())
++                    .with_partition_mode(mode)
++                    .with_projection(projection_for(required, &natural)?)
++                    .build()?;
++                Ok((Arc::new(join), required.to_vec()))
++            }
++            JoinKind::SortMerge => {
++                let join: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
++                    left.plan,
++                    right.plan,
++                    on,
++                    filter,
++                    join_type,
++                    vec![SortOptions::default(); keys],
++                    self.graph.null_equality(),
++                )?);
++                // A sort merge join emits every column, so drop the ones nothing above
++                // needs here rather than once above the whole subtree: what this join
++                // emits is what the next one sorts. `ProjectionPushdown` cannot do it
++                // afterwards, since it only pushes through a join whose columns stay
++                // left-then-right, and reordering interleaves them. Reordering alone is
++                // left to the parent, which addresses columns by position anyway.
++                if required.len() == natural.len() {
++                    return Ok((join, natural));
++                }
++                let Some(projection) = projection_for(required, &natural)? else {
++                    return Ok((join, natural));
++                };
++                Ok((narrow(join, &projection)?, required.to_vec()))
++            }
++        }
++    }
++
++    fn inner(
++        &self,
++        required: &[ColRef],
++        left_mask: RelSet,
++        right_mask: RelSet,
++        mode: PartitionMode,
++    ) -> Result<(Arc<dyn ExecutionPlan>, Vec<ColRef>)> {
++        // Each edge crosses exactly one cut, at the lowest node holding both endpoints.
++        let mut keys: Vec<(&Key, &Key)> = vec![];
++        for edge in &self.graph.edges {
++            let (left, right) = (&edge.left, &edge.right);
++            if left_mask & bit(left.column.rel) != 0
++                && right_mask & bit(right.column.rel) != 0
++            {
++                keys.push((left, right));
++            } else if left_mask & bit(right.column.rel) != 0
++                && right_mask & bit(left.column.rel) != 0
++            {
++                keys.push((right, left));
++            }
++        }
++        // Filters land at their lowest common ancestor: covered here, by neither input.
++        let mask = left_mask | right_mask;
++        let filters: Vec<&Filter> = self
++            .graph
++            .filters
++            .iter()
++            .filter(|filter| {
++                covers(mask, filter.required)
++                    && !covers(left_mask, filter.required)
++                    && !covers(right_mask, filter.required)
++            })
++            .collect();
++
++        // Each side emits this join's keys, its filters' columns, and what is needed
++        // above.
++        let child_required = |side: RelSet, take_left: bool| {
++            let mut columns: Vec<ColRef> = vec![];
++            for (left, right) in &keys {
++                push_unique(&mut columns, if take_left { left } else { right }.column);
++            }
++            for filter in &filters {
++                extend_required(&mut columns, &filter.columns, side);
++            }
++            extend_required(&mut columns, required, side);
++            columns
++        };
++
++        let (left_plan, left_columns) =
++            self.node(left_mask, &child_required(left_mask, true))?;
++        let (right_plan, right_columns) =
++            self.node(right_mask, &child_required(right_mask, false))?;
++
++        let on = keys
++            .iter()
++            .map(|(left, right)| {
++                Ok((
++                    key_expr(&left_columns, &left_plan, left)?,
++                    key_expr(&right_columns, &right_plan, right)?,
++                ))
++            })
++            .collect::<Result<Vec<_>>>()?;
++        let filter = rebuild_filters(&filters, &left_columns, &right_columns)?;
++
++        self.build_join(
++            Built {
++                plan: left_plan,
++                columns: left_columns,
++            },
++            Built {
++                plan: right_plan,
++                columns: right_columns,
++            },
++            JoinSpec {
++                on,
++                join_type: JoinType::Inner,
++                filter,
++                mode,
++            },
++            required,
++        )
++    }
++
++    fn applying(
++        &self,
++        mask: RelSet,
++        required: &[ColRef],
++        applied: usize,
++        mode: PartitionMode,
++    ) -> Result<(Arc<dyn ExecutionPlan>, Vec<ColRef>)> {
++        let Some(info) = self.graph.applied(applied) else {
++            return internal_err!("relation {applied} is not applied to another");
++        };
++        let other_mask = mask & !bit(applied);
++
++        // Filters never land here: they reference relations this one is applied to, so
++        // their lowest covering node is always inside that side.
++        let mut other_required: Vec<ColRef> = vec![];
++        for key in &info.keys {
++            push_unique(&mut other_required, key.other.column);
++        }
++        extend_required(&mut other_required, required, other_mask);
++
++        let (other_plan, other_columns) = self.node(other_mask, &other_required)?;
++        let applied_plan = Arc::clone(&self.relations[applied]);
++
++        // The applied relation builds so the other side streams, which is what the
++        // `Right` join types emit the rows of.
++        let applied_schema = applied_plan.schema();
++        let on = info
++            .keys
++            .iter()
++            .map(|key| {
++                Ok((
++                    Arc::clone(&key.expr),
++                    key_expr(&other_columns, &other_plan, &key.other)?,
++                ))
++            })
++            .collect::<Result<Vec<_>>>()?;
++
++        let join_type = match info.kind {
++            AppliedKind::Semi => JoinType::RightSemi,
++            AppliedKind::Anti => JoinType::RightAnti,
++            AppliedKind::Outer => JoinType::Right,
++            AppliedKind::Mark => JoinType::RightMark,
++        };
++        let applied_columns = info.kind.emitted(applied, applied_schema.fields().len());
++
++        self.build_join(
++            Built {
++                plan: applied_plan,
++                columns: applied_columns,
++            },
++            Built {
++                plan: other_plan,
++                columns: other_columns,
++            },
++            JoinSpec {
++                on,
++                join_type,
++                filter: None,
++                mode,
++            },
++            required,
++        )
++    }
++}
++
++/// The key again, reading the column where the rebuilt input emits it.
++fn key_expr(
++    columns: &[ColRef],
++    plan: &Arc<dyn ExecutionPlan>,
++    key: &Key,
++) -> Result<PhysicalExprRef> {
++    let Some(index) = position(columns, key.column) else {
++        return internal_err!("join enumeration lost column {:?}", key.column);
++    };
++    let column = Arc::new(Column::new(plan.schema().field(index).name(), index))
++        as PhysicalExprRef;
++    let Some(wrapper) = &key.wrapper else {
++        return Ok(column);
++    };
++    Arc::clone(wrapper)
++        .transform(|expr| {
++            Ok(match expr.downcast_ref::<Column>() {
++                Some(_) => Transformed::yes(Arc::clone(&column)),
++                None => Transformed::no(expr),
++            })
++        })
++        .data()
++}
++
++/// Wraps `plan` in a projection keeping only `indices`, in that order.
++fn narrow(
++    plan: Arc<dyn ExecutionPlan>,
++    indices: &[usize],
++) -> Result<Arc<dyn ExecutionPlan>> {
++    let schema = plan.schema();
++    let exprs: Vec<ProjectionExpr> = indices
++        .iter()
++        .map(|&index| {
++            let name = schema.field(index).name();
++            ProjectionExpr {
++                expr: Arc::new(Column::new(name, index)),
++                alias: name.clone(),
++            }
++        })
++        .collect();
++    Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
++}
++
++fn projection_for(required: &[ColRef], emitted: &[ColRef]) -> Result<Option<Vec<usize>>> {
++    let mut projection = Vec::with_capacity(required.len());
++    for col in required {
++        let Some(index) = position(emitted, *col) else {
++            return internal_err!("join enumeration lost column {col:?}");
++        };
++        projection.push(index);
++    }
++    let identity = projection.len() == emitted.len()
++        && projection.iter().enumerate().all(|(idx, col)| idx == *col);
++    Ok((!identity).then_some(projection))
++}
++
++/// One built input and the columns it emits.
++struct Built {
++    plan: Arc<dyn ExecutionPlan>,
++    columns: Vec<ColRef>,
++}
++
++/// One join as the search decided it, including the mode it was costed with.
++struct JoinSpec {
++    on: Vec<(PhysicalExprRef, PhysicalExprRef)>,
++    join_type: JoinType,
++    filter: Option<JoinFilter>,
++    mode: PartitionMode,
++}
++
++/// Rebuilds the non-equi filters applied at one join as one conjunction. A [`JoinFilter`]
++/// addresses its batch by index, so merging shifts all but the first filter's indices.
++fn rebuild_filters(
++    filters: &[&Filter],
++    left_columns: &[ColRef],
++    right_columns: &[ColRef],
++) -> Result<Option<JoinFilter>> {
++    let Some((first, rest)) = filters.split_first() else {
++        return Ok(None);
++    };
++
++    let mut expression = Arc::clone(first.filter.expression());
++    let mut fields: Vec<FieldRef> =
++        first.filter.schema().fields().iter().cloned().collect();
++    let mut columns: Vec<ColRef> = first.columns.clone();
++    for filter in rest {
++        let shifted =
++            shift_columns(Arc::clone(filter.filter.expression()), fields.len())?;
++        expression = Arc::new(BinaryExpr::new(expression, Operator::And, shifted)) as _;
++        fields.extend(filter.filter.schema().fields().iter().cloned());
++        columns.extend_from_slice(&filter.columns);
++    }
++
++    let column_indices = columns
++        .iter()
++        .map(|col| {
++            if let Some(index) = position(left_columns, *col) {
++                Ok(ColumnIndex {
++                    index,
++                    side: JoinSide::Left,
++                })
++            } else if let Some(index) = position(right_columns, *col) {
++                Ok(ColumnIndex {
++                    index,
++                    side: JoinSide::Right,
++                })
++            } else {
++                internal_err!("join enumeration lost filter column {col:?}")
++            }
++        })
++        .collect::<Result<Vec<_>>>()?;
++
++    // Intermediate columns go left side first: a sort merge join rebuilds the batch as
++    // all left then all right columns, so interleaved sides would read wrong columns.
++    let mut order: Vec<usize> = (0..column_indices.len()).collect();
++    order.sort_by_key(|i| column_indices[*i].side == JoinSide::Right);
++    let mut moved = vec![0; order.len()];
++    for (to, from) in order.iter().enumerate() {
++        moved[*from] = to;
++    }
++
++    Ok(Some(JoinFilter::new(
++        remap_columns(expression, &moved)?,
++        order.iter().map(|i| column_indices[*i].clone()).collect(),
++        Arc::new(Schema::new(
++            order
++                .iter()
++                .map(|i| Arc::clone(&fields[*i]))
++                .collect::<Vec<_>>(),
++        )),
++    )))
++}
++
++fn shift_columns(expression: PhysicalExprRef, offset: usize) -> Result<PhysicalExprRef> {
++    if offset == 0 {
++        return Ok(expression);
++    }
++    rewrite_columns(expression, &|index| index + offset)
++}
++
++fn remap_columns(
++    expression: PhysicalExprRef,
++    moved: &[usize],
++) -> Result<PhysicalExprRef> {
++    if moved.iter().enumerate().all(|(from, to)| from == *to) {
++        return Ok(expression);
++    }
++    rewrite_columns(expression, &|index| moved[index])
++}
++
++fn rewrite_columns(
++    expression: PhysicalExprRef,
++    index: &dyn Fn(usize) -> usize,
++) -> Result<PhysicalExprRef> {
++    expression
++        .transform(|expr| {
++            Ok(match expr.downcast_ref::<Column>() {
++                Some(column) => Transformed::yes(Arc::new(Column::new(
++                    column.name(),
++                    index(column.index()),
++                )) as _),
++                None => Transformed::no(expr),
++            })
++        })
++        .data()
++}
++
++type RewrittenRelation = (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>);
++
++/// Substitutes rewritten relations into a subtree, leaving its shape untouched. The
++/// relations are the exact `Arc`s taken from it, so pointer identity finds them.
++fn replace_relations(
++    plan: &Arc<dyn ExecutionPlan>,
++    rewritten: &[RewrittenRelation],
++) -> Result<Option<Arc<dyn ExecutionPlan>>> {
++    if rewritten.is_empty() {
++        return Ok(None);
++    }
++    if let Some((_, new)) = rewritten
++        .iter()
++        .find(|(original, _)| Arc::ptr_eq(original, plan))
++    {
++        return Ok(Some(Arc::clone(new)));
++    }
++    let mut changed = false;
++    let children = plan
++        .children()
++        .into_iter()
++        .map(|child| match replace_relations(child, rewritten)? {
++            Some(new_child) => {
++                changed = true;
++                Ok(new_child)
++            }
++            None => Ok(Arc::clone(child)),
++        })
++        .collect::<Result<Vec<_>>>()?;
++    if changed {
++        Ok(Some(replace_children_if_necessary(
++            Arc::clone(plan),
++            children,
++        )?))
++    } else {
++        Ok(None)
++    }
++}
++
++pub(crate) fn enumerate_join_order(
++    plan: &Arc<dyn ExecutionPlan>,
++    config: &ConfigOptions,
++    stats: &mut StatsFn,
++    cost_model: &dyn JoinCostModelFactory,
++) -> Result<Option<Arc<dyn ExecutionPlan>>> {
++    if let Some(graph) = extract(plan, stats)? {
++        if let Some(reordered) = reorder(&graph, config, stats, cost_model)? {
++            return Ok(Some(reordered));
++        }
++        // Rejected, so descend into the relations rather than the children: re-extracting
++        // here would re-search costed subsets and readmit what the margin turned down.
++        let mut rewritten: Vec<RewrittenRelation> = vec![];
++        for relation in &graph.relations {
++            if let Some(new) =
++                enumerate_join_order(&relation.plan, config, stats, cost_model)?
++            {
++                rewritten.push((Arc::clone(&relation.plan), new));
++            }
++        }
++        return replace_relations(plan, &rewritten);
++    }
++
++    let mut changed = false;
++    let children = plan
++        .children()
++        .into_iter()
++        .map(
++            |child| match enumerate_join_order(child, config, stats, cost_model)? {
++                Some(new_child) => {
++                    changed = true;
++                    Ok(new_child)
++                }
++                None => Ok(Arc::clone(child)),
++            },
++        )
++        .collect::<Result<Vec<_>>>()?;
++    if changed {
++        Ok(Some(replace_children_if_necessary(
++            Arc::clone(plan),
++            children,
++        )?))
++    } else {
++        Ok(None)
++    }
++}
++
++fn reorder(
++    graph: &JoinGraph,
++    config: &ConfigOptions,
++    stats: &mut StatsFn,
++    cost_model: &dyn JoinCostModelFactory,
++) -> Result<Option<Arc<dyn ExecutionPlan>>> {
++    let limit = config.optimizer.join_enumeration_limit.min(MAX_RELATIONS);
++    if graph.relations.len() > limit {
++        return Ok(None);
++    }
++    let model = cost_model.create(graph, config)?;
++    let Some(solution) = dphyp::solve(graph, model.as_ref()) else {
++        return Ok(None);
++    };
++
++    // Nothing cheaper found, so leave the plan alone rather than rebuild it into an
++    // order the estimates cannot tell apart from the one it has.
++    if solution.cost >= model.tree_cost(&graph.original_nodes) {
++        return Ok(None);
++    }
++
++    let mut relations = Vec::with_capacity(graph.relations.len());
++    for relation in &graph.relations {
++        relations.push(
++            enumerate_join_order(&relation.plan, config, stats, cost_model)?
++                .unwrap_or_else(|| Arc::clone(&relation.plan)),
++        );
++    }
++
++    let rebuilder = Rebuilder {
++        graph,
++        model: model.as_ref(),
++        solution: &solution,
++        relations: &relations,
++    };
++    let (plan, columns) = rebuilder.node(graph.all(), &graph.output)?;
++    if columns == graph.output {
++        return Ok(Some(plan));
++    }
++    // Only a sort merge subtree reaches here, when its root emits more than the output.
++    let Some(projection) = projection_for(&graph.output, &columns)? else {
++        return Ok(Some(plan));
++    };
++    Ok(Some(narrow(plan, &projection)?))
++}
+diff --git a/datafusion/physical-optimizer/src/join_selection.rs b/datafusion/physical-optimizer/src/join_selection.rs
+index 42736f8..69e0fef 100644
+--- a/datafusion/physical-optimizer/src/join_selection.rs
++++ b/datafusion/physical-optimizer/src/join_selection.rs
+@@ -21,7 +21,9 @@
+ //! tries to transform a non-runnable query (with the given infinite sources)
+ //! into a runnable query by replacing pipeline-breaking join operations with
+ //! pipeline-friendly ones. To achieve the second goal, it selects the proper
+-//! `PartitionMode` and the build side using the available statistics for hash joins.
++//! `PartitionMode` and the build side using the available statistics for hash
++//! joins. The shape of the join tree is chosen before this, by
++//! [`JoinEnumeration`](crate::join_enumeration::JoinEnumeration).
+ 
+ use crate::PhysicalOptimizerRule;
+ use crate::optimizer::{ConfigOnlyContext, PhysicalOptimizerContext};
+@@ -33,7 +35,12 @@ use datafusion_common::{JoinSide, JoinType, internal_err};
+ use datafusion_expr_common::sort_properties::SortProperties;
+ use datafusion_physical_expr::LexOrdering;
+ use datafusion_physical_expr::expressions::Column;
++use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
++use datafusion_physical_plan::Distribution;
+ use datafusion_physical_plan::execution_plan::EmissionType;
++use datafusion_physical_plan::execution_plan::{
++    ChildrenPropertiesMode, ReplaceChildrenOptions,
++};
+ use datafusion_physical_plan::joins::utils::ColumnIndex;
+ use datafusion_physical_plan::joins::{
+     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+@@ -170,10 +177,13 @@ impl PhysicalOptimizerRule for JoinSelection {
+         let new_plan = plan
+             .transform_up(|p| apply_subrules(p, &subrules, config))
+             .data()?;
+-        new_plan
++        let new_plan = new_plan
+             .transform_up(|plan| {
+                 statistical_join_selection_subrule(plan, config, registry)
+             })
++            .data()?;
++        new_plan
++            .transform_down(|plan| keep_partitioning_needed_above(plan, registry))
+             .data()
+     }
+ 
+@@ -186,6 +196,150 @@ impl PhysicalOptimizerRule for JoinSelection {
+     }
+ }
+ 
++/// How far above a join a hash requirement still counts as that join's, enough to reach
++/// through the partial aggregate a group-by is planned as.
++const PARTITIONING_LOOKAHEAD: usize = 3;
++
++/// Restores a partitioned join whose partitioning an operator above needs. Collecting the
++/// build side saves its exchanges but discards the partitioning, which is then rebuilt
++/// above, at more than collecting saved.
++fn keep_partitioning_needed_above(
++    plan: Arc<dyn ExecutionPlan>,
++    registry: Option<&StatisticsRegistry>,
++) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
++    let mut children: Vec<_> = plan.children().into_iter().map(Arc::clone).collect();
++    let mut changed = false;
++    let requirements = plan.input_distribution_requirements();
++    for (idx, required) in requirements.per_child_distributions().enumerate() {
++        #[expect(
++            deprecated,
++            reason = "HashPartitioned is still planned during the KeyPartitioned migration"
++        )]
++        let (Distribution::KeyPartitioned(required_exprs)
++        | Distribution::HashPartitioned(required_exprs)) = required
++        else {
++            continue;
++        };
++        if let Some(rewritten) =
++            repartition_collected_join(&children[idx], required_exprs, registry)?
++        {
++            children[idx] = rewritten;
++            changed = true;
++        }
++    }
++    if changed {
++        Ok(Transformed::yes(plan.replace_children(
++            children,
++            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
++        )?))
++    } else {
++        Ok(Transformed::no(plan))
++    }
++}
++
++/// Rebuilds the collected join under `plan` as partitioned when its keys are what
++/// `required_exprs` asks for, looking through the operators that pass a partitioning up.
++fn repartition_collected_join(
++    plan: &Arc<dyn ExecutionPlan>,
++    required_exprs: &[Arc<dyn PhysicalExpr>],
++    registry: Option<&StatisticsRegistry>,
++) -> Result<Option<Arc<dyn ExecutionPlan>>> {
++    let Some(required) = column_names(required_exprs) else {
++        return Ok(None);
++    };
++    let mut node = Arc::clone(plan);
++    for depth in 0..PARTITIONING_LOOKAHEAD {
++        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
++            if *join.partition_mode() != PartitionMode::CollectLeft
++                || join.on().is_empty()
++            {
++                return Ok(None);
++            }
++            // The join is not hash partitioned yet, its inputs still being single
++            // partitions, so compare against the keys it would be partitioned on.
++            let keys: Vec<_> =
++                join.on().iter().map(|(left, _)| Arc::clone(left)).collect();
++            if column_names(&keys).is_none_or(|keys| keys != required) {
++                return Ok(None);
++            }
++            if !worth_partitioning(join, registry)? {
++                return Ok(None);
++            }
++            let partitioned: Arc<dyn ExecutionPlan> = Arc::new(
++                join.builder()
++                    .with_partition_mode(PartitionMode::Partitioned)
++                    .build()?,
++            );
++            return Ok(Some(rebuild_above(plan, &node, partitioned, depth)?));
++        }
++        // Only a single-input operator with no requirement of its own passes one up.
++        let children = node.children();
++        let [child] = children.as_slice() else {
++            return Ok(None);
++        };
++        if !matches!(
++            node.input_distribution_requirements().child_distribution(0),
++            Some(Distribution::UnspecifiedDistribution)
++        ) {
++            return Ok(None);
++        }
++        let child = Arc::clone(child);
++        drop(children);
++        node = child;
++    }
++    Ok(None)
++}
++
++/// Whether partitioning the join moves no more rows than collecting it does. Both move
++/// the build side; partitioning then moves the probe side, collecting the output above.
++fn worth_partitioning(
++    join: &HashJoinExec,
++    registry: Option<&StatisticsRegistry>,
++) -> Result<bool> {
++    let rows = |plan: &dyn ExecutionPlan| -> Result<Option<usize>> {
++        Ok(get_stats(plan, registry)?.num_rows.get_value().copied())
++    };
++    let (Some(probe), Some(output)) = (rows(join.right().as_ref())?, rows(join)?) else {
++        return Ok(false);
++    };
++    Ok(output >= probe)
++}
++
++/// The names the expressions partition on, or `None` if any is not a column.
++fn column_names(exprs: &[Arc<dyn PhysicalExpr>]) -> Option<Vec<&str>> {
++    exprs
++        .iter()
++        .map(|expr| expr.downcast_ref::<Column>().map(Column::name))
++        .collect()
++}
++
++/// Puts `replacement` back under the `depth` single-input operators above it.
++fn rebuild_above(
++    top: &Arc<dyn ExecutionPlan>,
++    old: &Arc<dyn ExecutionPlan>,
++    replacement: Arc<dyn ExecutionPlan>,
++    depth: usize,
++) -> Result<Arc<dyn ExecutionPlan>> {
++    if depth == 0 {
++        return Ok(replacement);
++    }
++    let mut rebuilt = replacement;
++    let mut chain = vec![];
++    let mut node = Arc::clone(top);
++    while !Arc::ptr_eq(&node, old) {
++        chain.push(Arc::clone(&node));
++        let child = Arc::clone(node.children()[0]);
++        node = child;
++    }
++    for parent in chain.into_iter().rev() {
++        rebuilt = parent.replace_children(
++            vec![rebuilt],
++            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
++        )?;
++    }
++    Ok(rebuilt)
++}
++
+ /// Tries to create a [`HashJoinExec`] in [`PartitionMode::CollectLeft`] when possible.
+ ///
+ /// This function will first consider the given join type and check whether the
+diff --git a/datafusion/physical-optimizer/src/lib.rs b/datafusion/physical-optimizer/src/lib.rs
+index b9eb248..4d45f57 100644
+--- a/datafusion/physical-optimizer/src/lib.rs
++++ b/datafusion/physical-optimizer/src/lib.rs
+@@ -34,6 +34,7 @@ pub mod ensure_requirements;
+ // modules keep their public paths.
+ pub use ensure_requirements::{enforce_distribution, enforce_sorting};
+ pub mod filter_pushdown;
++pub mod join_enumeration;
+ pub mod join_selection;
+ pub mod limit_pushdown;
+ pub mod limit_pushdown_past_window;
+diff --git a/datafusion/physical-optimizer/src/optimizer.rs b/datafusion/physical-optimizer/src/optimizer.rs
+index aed2554..21be83d 100644
+--- a/datafusion/physical-optimizer/src/optimizer.rs
++++ b/datafusion/physical-optimizer/src/optimizer.rs
+@@ -25,6 +25,7 @@ use crate::combine_partial_final_agg::CombinePartialFinalAggregate;
+ use crate::ensure_coop::EnsureCooperative;
+ use crate::ensure_requirements::EnsureRequirements;
+ use crate::filter_pushdown::FilterPushdown;
++use crate::join_enumeration::JoinEnumeration;
+ use crate::join_selection::JoinSelection;
+ use crate::limit_pushdown::LimitPushdown;
+ use crate::limited_distinct_aggregation::LimitedDistinctAggregation;
+@@ -93,6 +94,9 @@ impl PhysicalOptimizer {
+             // this information is not lost across different rules during optimization.
+             Arc::new(OutputRequirements::new_add_mode()),
+             Arc::new(AggregateStatistics::new()),
++            // Must run before JoinSelection, which decides each join's build side and
++            // partition mode.
++            Arc::new(JoinEnumeration::new()),
+             // Statistics-based join selection will change the Auto mode to a real join implementation,
+             // like collect left, or hash join, or future sort merge join, which will influence the
+             // EnsureRequirements rule as it decides whether to add additional repartitioning and
+diff --git a/datafusion/physical-plan/src/filter.rs b/datafusion/physical-plan/src/filter.rs
+index 5df5482..b916598 100644
+--- a/datafusion/physical-plan/src/filter.rs
++++ b/datafusion/physical-plan/src/filter.rs
+@@ -35,6 +35,7 @@ use crate::filter_pushdown::{
+     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+     FilterPushdownPropagation, PushedDown,
+ };
++use crate::joins::utils::max_distinct_count;
+ use crate::limit::LocalLimitExec;
+ use crate::metrics::{MetricBuilder, MetricType};
+ use crate::projection::{
+@@ -63,13 +64,13 @@ use datafusion_execution::TaskContext;
+ use datafusion_expr::Operator;
+ use datafusion_physical_expr::equivalence::ProjectionMapping;
+ use datafusion_physical_expr::expressions::{
+-    BinaryExpr, Column, IsNotNullExpr, Literal, lit,
++    BinaryExpr, Column, InListExpr, IsNotNullExpr, Literal, lit,
+ };
+ use datafusion_physical_expr::intervals::utils::check_support;
+ use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
+ use datafusion_physical_expr::{
+     AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
+-    conjunction, split_conjunction,
++    conjunction, conjunction_opt, split_conjunction,
+ };
+ 
+ use datafusion_physical_expr_common::physical_expr::fmt_sql;
+@@ -359,16 +360,49 @@ impl FilterExec {
+         } else {
+             let null_rejecting_columns = collect_null_rejecting_columns(predicate);
+ 
+-            if check_support(predicate, schema) {
++            // Estimate one top-level conjunct at a time: interval analysis rejects a whole
++            // predicate if any part is out of reach, and an expanded `IN` list is.
++            let (supported, rest): (Vec<_>, Vec<_>) = split_conjunction(predicate)
++                .into_iter()
++                .partition(|conjunct| check_support(conjunct, schema));
++            let split_anything = !rest.is_empty();
++
++            // An unrecognized conjunct contributes the default once, as the whole predicate
++            // used to.
++            let mut unanalyzed_selectivity = 1.0;
++            let mut has_unknown_conjunct = false;
++            for conjunct in rest {
++                match in_list_selectivity(
++                    conjunct,
++                    &input_stats.column_statistics,
++                    &input_num_rows,
++                ) {
++                    Some(selectivity) => unanalyzed_selectivity *= selectivity,
++                    None => has_unknown_conjunct = true,
++                }
++            }
++            if has_unknown_conjunct {
++                unanalyzed_selectivity *= default_selectivity as f64 / 100.0;
++            }
++
++            // Rebuilding re-associates the conjunction and interval propagation is
++            // shape sensitive, so pass the predicate through untouched if nothing split.
++            let analyzable = if split_anything {
++                conjunction_opt(supported.into_iter().cloned())
++            } else {
++                Some(Arc::clone(predicate))
++            };
++            if let Some(analyzable) = analyzable {
+                 let input_analysis_ctx = AnalysisContext::try_from_statistics(
+                     schema,
+                     &input_stats.column_statistics,
+                 )?;
+-                let analysis_ctx = analyze(predicate, input_analysis_ctx, schema)?;
+-                let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
++                let analysis_ctx = analyze(&analyzable, input_analysis_ctx, schema)?;
++                let selectivity =
++                    analysis_ctx.selectivity.unwrap_or(1.0) * unanalyzed_selectivity;
+                 let filtered_num_rows =
+                     input_num_rows.with_estimated_selectivity(selectivity);
+-                let cs = collect_new_statistics(
++                let mut cs = collect_new_statistics(
+                     schema,
+                     &input_stats.column_statistics,
+                     analysis_ctx.boundaries,
+@@ -376,12 +410,19 @@ impl FilterExec {
+                     &null_rejecting_columns,
+                     filtered_num_rows,
+                 );
++                // An equality that was split off pins its column to one distinct value.
++                for idx in &eq_columns {
++                    if let Some(col_stat) = cs.get_mut(*idx)
++                        && col_stat.distinct_count != Precision::Exact(1)
++                    {
++                        col_stat.distinct_count =
++                            distinct_count_for_singleton_domain(filtered_num_rows);
++                    }
++                }
+                 (selectivity, filtered_num_rows, cs)
+             } else {
+-                // Without interval boundaries, use the default selectivity and
+-                // apply the row-count constraints that still follow from the
+-                // filter predicate.
+-                let selectivity = default_selectivity as f64 / 100.0;
++                // No boundaries to derive, so keep the input's value statistics.
++                let selectivity = unanalyzed_selectivity;
+                 let filtered_num_rows =
+                     input_num_rows.with_estimated_selectivity(selectivity);
+                 let mut cs = input_stats.to_inexact().column_statistics;
+@@ -959,6 +1000,91 @@ impl EmbeddedProjection for FilterExec {
+ ///
+ /// Only AND conjunctions are traversed; OR is intentionally skipped
+ /// since `a = 1 OR a = 2` does not pin NDV to 1.
++/// Estimates `col IN (a, b, c)`, and the `OR` chain a short list expands into, as
++/// `distinct literals / distinct values`. Interval arithmetic cannot narrow a column
++/// from a disjunction, so such a conjunct would otherwise only take the default.
++///
++/// `None` when the conjunct is not a list of literals over one column.
++fn in_list_selectivity(
++    conjunct: &Arc<dyn PhysicalExpr>,
++    column_statistics: &[ColumnStatistics],
++    num_rows: &Precision<usize>,
++) -> Option<f64> {
++    let mut column = None;
++    let mut values: Vec<ScalarValue> = vec![];
++    if let Some(in_list) = conjunct.downcast_ref::<InListExpr>() {
++        if in_list.negated() {
++            // `NOT IN` selects most of the column; left to the default.
++            return None;
++        }
++        column = Some(in_list.expr().downcast_ref::<Column>()?);
++        for value in in_list.list() {
++            push_literal(&mut values, value)?;
++        }
++    } else {
++        // Disjunctions only, so a plain `col = literal` keeps the estimate it has.
++        let binary = conjunct.downcast_ref::<BinaryExpr>()?;
++        if *binary.op() != Operator::Or {
++            return None;
++        }
++        collect_or_equalities(conjunct, &mut column, &mut values)?;
++    }
++
++    let column = column?;
++    if values.len() < 2 {
++        return None;
++    }
++    let stats = column_statistics.get(column.index())?;
++    let distinct = *max_distinct_count(num_rows, stats).get_value()?;
++    if distinct == 0 {
++        return None;
++    }
++    Some((values.len() as f64 / distinct as f64).min(1.0))
++}
++
++fn push_literal(
++    values: &mut Vec<ScalarValue>,
++    expr: &Arc<dyn PhysicalExpr>,
++) -> Option<()> {
++    let value = expr.downcast_ref::<Literal>()?.value();
++    if !values.contains(value) {
++        values.push(value.clone());
++    }
++    Some(())
++}
++
++/// Collects the literals of an `OR` chain of equalities over one column. `None`
++/// for anything else, so `a = 1 OR b = 2` is not mistaken for a list.
++fn collect_or_equalities<'a>(
++    expr: &'a Arc<dyn PhysicalExpr>,
++    column: &mut Option<&'a Column>,
++    values: &mut Vec<ScalarValue>,
++) -> Option<()> {
++    let binary = expr.downcast_ref::<BinaryExpr>()?;
++    match binary.op() {
++        Operator::Or => {
++            collect_or_equalities(binary.left(), column, values)?;
++            collect_or_equalities(binary.right(), column, values)
++        }
++        Operator::Eq => {
++            let (found, literal) = match (
++                binary.left().downcast_ref::<Column>(),
++                binary.right().downcast_ref::<Column>(),
++            ) {
++                (Some(col), None) => (col, binary.right()),
++                (None, Some(col)) => (col, binary.left()),
++                _ => return None,
++            };
++            if column.is_some_and(|current| current != found) {
++                return None;
++            }
++            *column = Some(found);
++            push_literal(values, literal)
++        }
++        _ => None,
++    }
++}
++
+ fn collect_equality_columns(predicate: &Arc<dyn PhysicalExpr>) -> (HashSet<usize>, bool) {
+     let mut eq_values: HashMap<usize, ScalarValue> = HashMap::new();
+     let mut infeasible = false;
+@@ -2747,9 +2873,9 @@ mod tests {
+                         Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
+                     )),
+                 )),
+-                // Input NDV is 50, but the 20% default selectivity on 100 rows
+-                // estimates 20 output rows, so NDV is capped at 20.
+-                vec![Precision::Inexact(20)],
++                // The two listed values are 2 of the column's 50, so 4 of the 100 rows
++                // are expected and NDV is capped at 4, not collapsed to 1.
++                vec![Precision::Inexact(4)],
+             ),
+             (
+                 "AND with mixed types (Utf8 + Int32)",
+diff --git a/datafusion/physical-plan/src/joins/utils.rs b/datafusion/physical-plan/src/joins/utils.rs
+index 20467a7..6c05a57 100644
+--- a/datafusion/physical-plan/src/joins/utils.rs
++++ b/datafusion/physical-plan/src/joins/utils.rs
+@@ -466,12 +466,39 @@ pub(crate) fn estimate_join_statistics(
+     join_type: &JoinType,
+     schema: &Schema,
+ ) -> Result<Statistics> {
++    // Width of one output row, from the sides this join emits. Without it a join reports
++    // no size and `hash_join_single_partition_threshold` falls back to counting rows.
++    let width = |stats: &Statistics| match (
++        stats.total_byte_size.get_value(),
++        stats.num_rows.get_value(),
++    ) {
++        (Some(bytes), Some(rows)) if *rows > 0 => Some(*bytes as f64 / *rows as f64),
++        _ => None,
++    };
++    let output_width = match join_type {
++        JoinType::LeftSemi | JoinType::LeftAnti => width(&left_stats),
++        JoinType::RightSemi | JoinType::RightAnti => width(&right_stats),
++        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
++            width(&left_stats)
++                .zip(width(&right_stats))
++                .map(|(l, r)| l + r)
++        }
++        // A mark join emits one side plus a boolean.
++        JoinType::LeftMark => width(&left_stats).map(|w| w + 1.0),
++        JoinType::RightMark => width(&right_stats).map(|w| w + 1.0),
++    };
++
+     let join_stats =
+         estimate_join_cardinality(join_type, left_stats, right_stats, on, null_equality);
+     let (num_rows, total_byte_size, column_statistics) = match join_stats {
+         Some(stats) => (
+             Precision::Inexact(stats.num_rows),
+-            stats.total_byte_size,
++            match output_width {
++                Some(width) => {
++                    Precision::Inexact((stats.num_rows as f64 * width) as usize)
++                }
++                None => stats.total_byte_size,
++            },
+             stats.column_statistics,
+         ),
+         None => (
+@@ -1023,7 +1050,7 @@ fn estimate_semi_join_cardinality(
+ /// directly. Otherwise, if the column is numeric and has min/max values, it
+ /// estimates the maximum distinct count from those. Otherwise, the num_rows
+ /// is used.
+-fn max_distinct_count(
++pub fn max_distinct_count(
+     num_rows: &Precision<usize>,
+     stats: &ColumnStatistics,
+ ) -> Precision<usize> {

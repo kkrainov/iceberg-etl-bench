@@ -19,7 +19,7 @@ import yaml
 from m0.queries import Query, load_manifest
 
 COLD_POLICIES = ("per_query", "per_block")
-ENGINES = ("trino", "df", "dfd", "dfd-jo")
+ENGINES = ("trino", "df", "df-cs", "df-jo", "df-jo-cs", "df-sail", "df-sail-cs", "dfd", "dfd-jo")
 DEFAULTS = {"phase": "L", "rounds": None, "mem_levels": [100], "iterations": 5,
             "cold": "per_query", "timeout_s": 600, "result_rows_cap": 100_000, "diag": False}
 

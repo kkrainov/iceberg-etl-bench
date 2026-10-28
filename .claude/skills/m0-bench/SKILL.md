@@ -37,6 +37,7 @@ add `--json` for machine-readable output.
 | `m0 env up` | Start infra (object store, Iceberg REST catalog). Idempotent. |
 | `m0 env up --engine trino` | Also start Trino (recreated, so it's cold) and run a write/read smoke test |
 | `m0 env up --engine df` | Stop Trino, build the `dfrunner` image (incremental; first build ~10 min), start plain DataFusion cold and run a read smoke test |
+| `m0 env up --engine df-jo` | The same for a step 4c variant (`df-cs`, `df-jo`, `df-jo-cs`, `df-sail`, `df-sail-cs`): builds the variant's image (`df-jo` and `df-sail` are separate builds, ~5 min each) and starts it on port 9000 |
 | `m0 env status` | Health of every service, plus whether the warehouse exists |
 | `m0 env down` | Stop the stack. Data is kept. |
 | `m0 env down --purge --yes` | Stop the stack and delete all data (ask first) |
@@ -45,15 +46,18 @@ add `--json` for machine-readable output.
 | `m0 data verify --engine df` | Fingerprint every table through an engine and compare with Trino's (`m0 data verify --engine trino` first, with Trino up). Lists every table or column that differs or can't be read. Exit code 3 = differences (findings, not errors). |
 | `m0 run plans/phase-l-smoke.yaml` | Execute a plan (the smoke plan runs `trino` and `df` in ABBA order and switches engines itself); prints non-ok cells and restarts as they happen, then outcome counts. `--query`, `--engine` filter; `--run-id` names the run; `--resume` continues it. Exit code 3 = some cells not ok (expected for the smoke plan). |
 | `m0 status` | Progress and last failure of the latest run (or `m0 status <run-id>`) |
-| `m0 summarize` | A finished run in at most 40 lines: outcomes, answer diffs against Trino, suite totals, ratios with 95% CIs, slowest queries, every failure group, every mismatch. `m0 summarize <run-id> --json` for everything. Exit code 3 = some cells not ok. |
-| `m0 compare <run-a> <run-b>` | Run B against run A per engine (B/A times, moved queries, outcome changes, changed images and configs) |
+| `m0 summarize` | A finished run in at most 40 lines: outcomes, answer diffs against Trino, suite totals, ratios with 95% CIs, slowest queries, every failure group, every mismatch. `m0 summarize <run-id> --json` for everything. `m0 summarize <run-id> --with <other-run>` adds the other run's engines (e.g. the `trino`/`df` baseline for an A6 run). Exit code 3 = some cells not ok. |
+| `m0 compare <run-a> <run-b>` | Run B against run A per engine (B/A times, moved queries, outcome changes, changed images and configs). `m0 compare <run-a> <run-b> --engines df:df-jo` pairs engine `df` of A with `df-jo` of B. |
 | `m0 explain <run-id> <engine> <query>` | Re-run one query on the live engine; saves the plan with metrics under the run's `diag/`, prints the top operators. Needs the engine up. |
 | `m0 logs <run-id> <engine> <query>` | Engine log lines during that query's cells (`--grep`, `--tail`); says when the container was recreated and the lines are gone |
 | `m0 results list` | Every run under `results/` with state, cells, size, and whether `results/keep.txt` keeps it |
 | `m0 results prune` | Dry run: which runs not kept would be deleted. `--yes` deletes them, `--keep <id>` spares one more. Ask the user before `--yes` unless they asked for the cleanup. |
 
-Engines now: `trino` (Trino 484) and `df` (DataFusion 55 in `dfrunner single`). `dfd`
-arrives with step 5.
+Engines now: `trino` (Trino 484) and `df` (DataFusion 55 in `dfrunner single`), plus the
+step 4c variants of `df` for suite A6: `df-cs` (Iceberg column statistics on), `df-jo`
+and `df-jo-cs` (apache/datafusion#24456 join-order enumeration backported to 55.0.0),
+`df-sail` and `df-sail-cs` (Sail's `JoinReorder` rule). How they are built:
+`docs/framework-design.md` ("Engine variants"). `dfd` arrives with step 5.
 
 Standard loop: `doctor → env up --engine trino → data status → run → status →
 summarize → (explain / logs / compare) → results prune`. Analysis: runbook
@@ -94,7 +98,7 @@ Plans: `plans/phase-l-smoke.yaml` (minutes, after every harness change),
 | Answer comparison rules (differ), statistics | `m0/differ.py`, `m0/stats.py` (methodology sections 8 and 9) |
 | Query order keys and tie flags used by the differ | `queries/manifest.yaml` (`ordered`, `sort_keys`, `tie_ambiguous`) |
 | Runs that `m0 results prune` keeps (run IDs or globs) | `results/keep.txt` |
-| Container logs | `docker compose -p m0 logs <service> --tail 200` (services: `objstore`, `catalog`, `catalog-db`, `catalog-migrate`, `trino`, `df`) |
+| Container logs | `docker compose -p m0 logs <service> --tail 200` (services: `objstore`, `catalog`, `catalog-db`, `catalog-migrate`, `trino`, `df`, and the variants `df-cs`, `df-jo`, `df-jo-cs`, `df-sail`, `df-sail-cs`) |
 | dfrunner live state (versions, pool, running queries) | `curl -s 127.0.0.1:9000/status`; one query: `curl -s 127.0.0.1:9000/queries/<engine_query_id>` |
 
 ## When something goes wrong

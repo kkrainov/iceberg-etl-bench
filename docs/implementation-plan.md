@@ -33,7 +33,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
 | 3c | Simplify result storage (JSON only, fewer artifacts) | S | ✅ done |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | ✅ done |
-| 4c | Join-order variants early: `df-cs`, `df-jo(-cs)`, `df-sail(-cs)` at SF10 (A6, single node) | M | next |
+| 4c | Join-order variants early: `df-cs`, `df-jo(-cs)`, `df-sail(-cs)` at SF10 (A6, single node) | M | run 89% done, resuming |
+| 4d | Re-run A1+A2 at SF10: `trino` vs `df-cs` (DataFusion with column statistics) | S | next, after 4c's run |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
@@ -524,7 +525,53 @@ written only for cells named by the plan key `diag`.
   expression; checked by hand at the cut, no ties. Re-check at SF10.
 - `df` `scan_ms` is still null (from 3c); decide in step 5.
 
+## Decision 2026-10-28: DataFusion runs with column statistics on
+
+From now on every DataFusion measurement uses Iceberg column statistics
+(`iceberg.column_stats_enabled=true`), decided by the user on 2026-10-28.
+- **Why.** The datafusion-distributed Iceberg provider defaults to `false`, so the
+  2026-10-26 baseline gave DataFusion only table row counts and sizes, while Trino's
+  Iceberg connector reads column statistics by default. The comparison was not like
+  for like. In the A6 run (step 4c, preliminary), column statistics alone (`df-cs`)
+  removed all five `err_mem` queries of the baseline, at a cost of about 4 ms of
+  planning per query (median 9.9 → 13.6 ms hot).
+- **Main engine.** `df-cs` is the DataFusion engine in every later plan: step 4d,
+  step 5 (`dfd` and `dfd-jo` run with column statistics on), Gate L and Phase C.
+  The join-order variants compared against it are the `-cs` ones.
+- **`df` stays** as a single reference row labelled "DataFusion defaults", so the effect
+  of the setting stays visible. Engine names are not renamed: `df` means statistics off
+  in every stored run, `df-cs` means statistics on.
+- **Superseded:** the headline numbers of the 2026-10-26 run (geomean 1.70×, the five
+  failures) describe the defaults, not DataFusion with statistics. Step 4d replaces them.
+- **Not affected:** answer correctness (statistics change plans, not results; step 4d
+  checks this) and the Trino side.
+- **Scope of re-runs (user, 2026-10-28):** SF10 and the join-order tests only. SF1 is
+  not re-run.
+
+## Step 4d: A1+A2 at SF10 with column statistics
+
+**Goal.** Replace the headline comparison with one where both engines use column
+statistics.
+
+**Scope:**
+- Plan `plans/phase-l-a1a2cs-sf10.yaml`: identical to `phase-l-a1a2-sf10` (cold per
+  query, 5 hot, 2 rounds ABBA, 600 s timeout) with engines `trino` and `df-cs`. Trino
+  is measured again so both engines come from the same run.
+- Run it after step 4c's A6 run is complete (one benchmark at a time). Expected about
+  175 min.
+- Analysis as for the 2026-10-26 run: outcomes, hot geomean with CIs, totals, ratio
+  distribution, cold, peak memory, answers; and the change from the defaults run per
+  query (`m0 compare phase-l-a1a2-sf10-20261026-190808Z <run> --engines df:df-cs`).
+- Rewrite the Phase L result section with these numbers; keep the 2026-10-26 run as
+  the "DataFusion defaults" reference and in `results/keep.txt`.
+
+**Acceptance:** 3,000 cells with an outcome, answers diffed, results section updated.
+
 ## Phase L result: A1+A2 at SF10 (2026-10-26)
+
+> **Superseded as the headline comparison** (decision of 2026-10-28): `df` here runs
+> with column statistics off (the provider default) while Trino uses them. Kept as the
+> "DataFusion defaults" reference; step 4d gives the comparison with statistics on.
 
 Run `phase-l-a1a2-sf10-20261026-190808Z` (plan `phase-l-a1a2-sf10`: cold per query,
 5 hot, 2 rounds ABBA, 600 s timeout): 3,000 cells in 172.6 min.
@@ -633,6 +680,23 @@ All fail while building a hash join (`HashJoinInput`). Upstream state (checked
   filter estimation).
 - The PR moves; pin the head commit and note it in the draft.
 
+**Status 2026-10-28.** Implementation done by the sub-agent (harness wiring, the five
+variants, `m0 summarize --with`, `m0 compare --engines`; 195 tests pass), not yet
+verified by the lead or committed. Run `phase-l-a6-sf10-20261027` (2 rounds, 3 hot,
+5,000 cells) started 2026-10-27 19:35 CET and stopped at 4,456 cells when the PC was
+powered off from the Windows Start menu at 23:02 CET. Missing: `df-cs` round 2 (500
+cells) and the last 44 cells of `df-jo` round 2. Resumed with `--resume` before step 4d.
+Preliminary failing queries (not yet verified):
+- `df-cs`, `df-jo-cs`, `df-sail-cs`: none.
+- `df-jo`: 16 (`err_mem`): the baseline's tpcds q21, q39a, q39b, q72, plus q07, q24a,
+  q24b, q25, q47, q50, q57, q64, q67, tpch q05, q07, q09. Without column statistics the
+  enumerator orders joins from row counts alone and often builds on the large side.
+- `df-sail`: 5: tpcds q25, q29, q67, q80, tpch q18.
+
+Lesson for the workflow: a sub-agent must not poll a long run; it starts the run
+detached, reports the resume command and ends. Polling every 10 minutes rewrote its
+whole context each time and used up the session limit.
+
 ## Step 4b: investigation helpers
 
 **Carried over from 3b:**
@@ -693,6 +757,7 @@ on 2026-10-25.
 - **Multi-node Trino** for A3: a coordinator plus a worker, the same total resources
   as `dfd`.
 - **Optimizer variant** `dfd-jo`: the step 4c backport on the distributed build (A6).
+- `dfd` and `dfd-jo` run with column statistics on (decision of 2026-10-28).
 - **B1 ETL query catalogue:** J1–J4, G1–G2, W1–W3, T1, S1–S2.
 - **B2:** memory levels 100/50/25% applied consistently across container, pool and
   Trino limits.

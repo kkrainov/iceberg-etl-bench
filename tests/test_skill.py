@@ -76,3 +76,11 @@ def test_skill_exit_codes_exist():
     for path in SKILL_FILES:
         for code in re.findall(r"exit code `?(\d+)`?", path.read_text(), re.IGNORECASE):
             assert int(code) in valid, f"{path.name}: exit code {code} does not exist"
+
+
+def test_skill_names_every_engine():
+    from m0 import engines
+
+    text = "\n".join(p.read_text() for p in SKILL_FILES)
+    missing = [e for e in engines.available() if f"`{e}`" not in text]
+    assert not missing, f"engines the skill doesn't mention: {missing}"

@@ -67,6 +67,13 @@ Lines are capped at 40; anything cut says `+N … in --json`.
   from `cells.jsonl`. Trino logs little per query; its query info is in
   `diag/` (with `diag` in the plan) or `m0 explain`.
 - **Before/after an upgrade or config variant:** `m0 compare <old-run> <new-run>`.
+- **Engine variants in a separate run (A6):** the variants run without `trino` and `df`;
+  take those from the earlier run on the same machine and data:
+  `m0 summarize <a6-run> --with <baseline-run>` (outcomes, geomean vs Trino, answer diffs
+  vs Trino for every variant) and
+  `m0 compare <baseline-run> <a6-run> --engines df:df-jo --engines df:df-jo-cs` (each
+  variant against `df`: queries beyond noise, outcome changes). Different hot-run counts
+  between the runs are fine; medians are over each run's own hot runs.
 
 ## Noise rules
 

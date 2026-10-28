@@ -1,7 +1,7 @@
 """Query catalogue: `queries/manifest.yaml` plus canonical Trino SQL per query.
 
 A DataFusion override, `queries/overrides/datafusion/<suite>/<id>.sql`, replaces the
-canonical text for the DataFusion engines (`df`, `dfd`, `dfd-jo`). It is allowed only
+canonical text for the DataFusion engines (`df` and its variants, `dfd`, `dfd-jo`). It is allowed only
 for a mechanical rewrite (function name, syntax) that keeps the semantics, and the
 manifest must give the reason (`datafusion_override`). A file without a reason, or a
 reason without a file, is an error.
@@ -21,7 +21,9 @@ CATALOG = "iceberg"
 NAMESPACES = ("tpch", "tpcds", "etl")
 OVERRIDES_DIR = QUERIES_DIR / "overrides"
 # SQL dialect family per engine; None = canonical (Trino) text.
-DIALECT = {"trino": None, "df": "datafusion", "dfd": "datafusion", "dfd-jo": "datafusion"}
+DIALECT = {"trino": None, "df": "datafusion", "df-cs": "datafusion", "df-jo": "datafusion",
+           "df-jo-cs": "datafusion", "df-sail": "datafusion", "df-sail-cs": "datafusion",
+           "dfd": "datafusion", "dfd-jo": "datafusion"}
 ID_RE = re.compile(r"[A-Za-z0-9_]+")
 # Query parameters that the spec scales with the scale factor, as `${name}` placeholders.
 SF_PARAMS = {
