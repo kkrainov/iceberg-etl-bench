@@ -538,6 +538,9 @@ From now on every DataFusion measurement uses Iceberg column statistics
 - **Main engine.** `df-cs` is the DataFusion engine in every later plan: step 4d,
   step 5 (`dfd` and `dfd-jo` run with column statistics on), Gate L and Phase C.
   The join-order variants compared against it are the `-cs` ones.
+- **No more statistics-off runs** (user, 2026-10-28). No later plan includes `df`,
+  `df-jo`, `df-sail` or a statistics-off `dfd` variant. Their A6 results (step 4c) are
+  kept as a one-off data point; the 2026-10-26 run is the only `df` reference.
 - **`df` stays** as a single reference row labelled "DataFusion defaults", so the effect
   of the setting stays visible. Engine names are not renamed: `df` means statistics off
   in every stored run, `df-cs` means statistics on.
