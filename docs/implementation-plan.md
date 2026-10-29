@@ -33,8 +33,8 @@ Sizes: **S** = one session, **M** = 2–3 sessions, **L** = 4+ sessions.
 | 3b | `dfrunner` single mode (`df`) | L | ✅ done |
 | 3c | Simplify result storage (JSON only, fewer artifacts) | S | ✅ done |
 | 4 | Analysis: diff, stats, summaries, full query catalogue | M | ✅ done |
-| 4c | Join-order variants early: `df-cs`, `df-jo(-cs)`, `df-sail(-cs)` at SF10 (A6, single node) | M | run 89% done, resuming |
-| 4d | Re-run A1+A2 at SF10: `trino` vs `df-cs` (DataFusion with column statistics) | S | next, after 4c's run |
+| 4c | Join-order variants early: `df-cs`, `df-jo(-cs)`, `df-sail(-cs)` at SF10 (A6, single node) | M | runs ✅; explains and drafts open |
+| 4d | Re-run A1+A2 at SF10: `trino` vs `df-cs` (DataFusion with column statistics) | S | ✅ done |
 | 4b | Investigation helpers and deliberate failures | S | |
 | 5 | Environment interface, distributed `dfd`, memory levels, concurrency, B1 queries | L | |
 | 6 | Report | M | |
@@ -532,9 +532,10 @@ From now on every DataFusion measurement uses Iceberg column statistics
 - **Why.** The datafusion-distributed Iceberg provider defaults to `false`, so the
   2026-10-26 baseline gave DataFusion only table row counts and sizes, while Trino's
   Iceberg connector reads column statistics by default. The comparison was not like
-  for like. In the A6 run (step 4c, preliminary), column statistics alone (`df-cs`)
-  removed all five `err_mem` queries of the baseline, at a cost of about 4 ms of
-  planning per query (median 9.9 → 13.6 ms hot).
+  for like. In the A6 run (step 4c), column statistics alone (`df-cs`) removed all
+  five `err_mem` queries of the baseline, at a cost of about 4 ms of planning per query
+  (median 9.9 → 13.6 ms hot); q72 then completes but takes 334 s (Trino 2 s), which
+  only join ordering fixes.
 - **Main engine.** `df-cs` is the DataFusion engine in every later plan: step 4d,
   step 5 (`dfd` and `dfd-jo` run with column statistics on), Gate L and Phase C.
   The join-order variants compared against it are the `-cs` ones.
@@ -569,6 +570,47 @@ statistics.
   the "DataFusion defaults" reference and in `results/keep.txt`.
 
 **Acceptance:** 3,000 cells with an outcome, answers diffed, results section updated.
+
+**Done 2026-10-29** (see "Phase L result: A1+A2 at SF10 with column statistics"). The
+run was interrupted once on request (stopped at 1,822 cells on 2026-10-28, resumed
+2026-10-29 with `--resume`).
+
+## Phase L result: A1+A2 at SF10 with column statistics (2026-10-29)
+
+**Exploratory, single node.** Runs `phase-l-a1a2cs-sf10-20261028` (`trino`, `df-cs`;
+cold per query, 5 hot, 2 rounds ABBA, 600 s) and `phase-l-a6-sf10-20261027` (step 4c:
+`df-jo-cs`, `df-sail-cs`; 3 hot, 2 rounds). Same machine and data.
+- **Cross-run check.** `df-cs` ran in both: totals 445.2 s vs 442.6 s, geomean 0.97
+  [0.96–0.98], no query moved beyond noise. `trino` vs the 2026-10-26 run: 0.96
+  [0.95–0.98], none beyond noise. So the A6 variants can be set against this run's
+  `trino`; `df-cs` was about 3% faster in the newer run, so the A6 variants are, if
+  anything, slightly understated.
+- **Outcomes.** Every cell ok on all four engines: no `err_mem`, no timeouts.
+- **Answers.** `df-cs` vs `trino`: 122 match, 3 mismatch (q44, q61, q66, as in F6).
+  `df-jo-cs` and `df-sail-cs`: the same 122 / 3.
+
+Hot medians, trino time / engine time (above 1: engine faster); totals over all queries:
+
+| | `trino` | `df-cs` | `df-jo-cs` (#24456) | `df-sail-cs` (Sail) |
+|---|---|---|---|---|
+| TPC-DS geomean (103 queries) | 1 | 1.74× [1.72–1.77] | 2.10× | 2.07× |
+| TPC-H geomean (22) | 1 | 1.51× [1.48–1.55] | 1.60× | 1.59× |
+| All 125 | 1 | 1.69× | 2.00× | 1.97× |
+| Total time, all 125 | 168.9 s | 442.6 s | 95.2 s | 96.7 s |
+| Queries slower than `trino` | | 17 | 12 | 10 |
+| Queries > 2× slower than `trino` | | 4 (q72 165×, q21, q39a, q39b) | 0 | 0 |
+| Worst query | | q72: 2.0 s vs 333.9 s | 0.63× | 0.63× |
+
+- **`df-cs` alone fails the proposed "no query more than about 2× slower" threshold**
+  (methodology, Phase C proposal); with either join-ordering rule it passes on this
+  setup. The rule is unreleased (#24456) or downstream (Sail); a Trino drop-in controls
+  its own optimizer, so a downstream rule is a legitimate configuration.
+- **#24456 vs Sail, with statistics:** a tie (Sail/PR geomean 1.01 [1.01–1.02]; 12
+  queries faster on the PR beyond 10%, 7 on Sail; peak memory median 1.00). Largest
+  differences: tpch q18 (PR 1.27 s, Sail 2.28 s), tpcds q58, q40, q31 (PR faster);
+  q80, q72, q64 (Sail faster). Without statistics Sail degrades more gently (5 `err_mem`
+  queries vs 16).
+- The 2026-10-26 run stays as the "DataFusion defaults" reference.
 
 ## Phase L result: A1+A2 at SF10 (2026-10-26)
 
@@ -683,13 +725,17 @@ All fail while building a hash join (`HashJoinInput`). Upstream state (checked
   filter estimation).
 - The PR moves; pin the head commit and note it in the draft.
 
-**Status 2026-10-28.** Implementation done by the sub-agent (harness wiring, the five
-variants, `m0 summarize --with`, `m0 compare --engines`; 195 tests pass), not yet
-verified by the lead or committed. Run `phase-l-a6-sf10-20261027` (2 rounds, 3 hot,
+**Status 2026-10-29.** Implementation committed (`2076671`; harness wiring, the five
+variants, `m0 summarize --with`, `m0 compare --engines`; 195 tests pass). The run
+completed on 2026-10-28 (5,000 cells, resumed once). Results in "Phase L result: A1+A2
+at SF10 with column statistics". Open: SF10 explains (df-jo-cs vs df-sail-cs on the
+queries where they differ most; df-cs vs a reordering variant on q72), and the two
+draft comments, written after asking the user about their points.
+History: run `phase-l-a6-sf10-20261027` (2 rounds, 3 hot,
 5,000 cells) started 2026-10-27 19:35 CET and stopped at 4,456 cells when the PC was
 powered off from the Windows Start menu at 23:02 CET. Missing: `df-cs` round 2 (500
-cells) and the last 44 cells of `df-jo` round 2. Resumed with `--resume` before step 4d.
-Preliminary failing queries (not yet verified):
+cells) and the last 44 cells of `df-jo` round 2, resumed on 2026-10-28 with `--resume`.
+Failing queries (verified with `m0 summarize`):
 - `df-cs`, `df-jo-cs`, `df-sail-cs`: none.
 - `df-jo`: 16 (`err_mem`): the baseline's tpcds q21, q39a, q39b, q72, plus q07, q24a,
   q24b, q25, q47, q50, q57, q64, q67, tpch q05, q07, q09. Without column statistics the
